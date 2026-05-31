@@ -16,6 +16,8 @@ env/
 # GCP credentials — never commit these
 *.json
 application_default_credentials.json
+.env
+.envrc
 
 # IDE
 .idea/
