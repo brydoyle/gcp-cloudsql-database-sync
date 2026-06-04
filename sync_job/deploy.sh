@@ -222,15 +222,13 @@ if [[ -n "${ALERT_EMAIL}" ]]; then
     log "Reusing existing notification channel: ${CHANNEL_NAME}"
   fi
 
-  log "Creating alert policy..."
+  log "Creating failure alert policy..."
   POLICY_EXISTS=$(gcloud alpha monitoring policies list \
     --filter="displayName='${JOB_NAME} sync failed'" \
     --format="value(name)" \
     --project="${NONPROD_PROJECT}" 2>/dev/null | head -1)
 
   if [[ -z "${POLICY_EXISTS}" ]]; then
-    # Write the policy as JSON — the gcloud CLI flag interface for threshold
-    # conditions is unreliable across alpha/beta versions.
     POLICY_JSON=$(cat <<EOF
 {
   "displayName": "${JOB_NAME} sync failed",
@@ -245,30 +243,100 @@ if [[ -n "${ALERT_EMAIL}" ]]; then
       "comparison": "COMPARISON_GT",
       "thresholdValue": 0,
       "duration": "0s",
-      "aggregations": [{
-        "alignmentPeriod": "60s",
-        "perSeriesAligner": "ALIGN_COUNT"
-      }]
+      "aggregations": [{"alignmentPeriod": "60s", "perSeriesAligner": "ALIGN_COUNT"}]
     }
   }],
-  "alertStrategy": {
-    "notificationRateLimit": { "period": "3600s" }
-  },
+  "alertStrategy": { "notificationRateLimit": { "period": "3600s" } },
   "combiner": "OR",
   "notificationChannels": ["${CHANNEL_NAME}"]
 }
 EOF
 )
     echo "${POLICY_JSON}" | gcloud alpha monitoring policies create \
-      --policy-from-file=- \
-      --project="${NONPROD_PROJECT}"
-    log "Alert policy created — emails will be sent to ${ALERT_EMAIL} on failure."
+      --policy-from-file=- --project="${NONPROD_PROJECT}"
+    log "Failure alert policy created."
   else
-    log "Alert policy already exists: ${POLICY_EXISTS}"
+    log "Failure alert policy already exists."
   fi
+
+  # Success metric — fires when "Sync finished successfully." is logged.
+  SUCCESS_METRIC="${JOB_NAME}-success"
+  log "Creating log-based success metric..."
+  gcloud logging metrics create "${SUCCESS_METRIC}" \
+    --description="Successful executions of the ${JOB_NAME} Cloud Run Job" \
+    --log-filter="resource.type=\"cloud_run_job\" AND resource.labels.job_name=\"${JOB_NAME}\" AND textPayload=\"Sync finished successfully.\"" \
+    --project="${NONPROD_PROJECT}" 2>/dev/null || \
+  gcloud logging metrics update "${SUCCESS_METRIC}" \
+    --description="Successful executions of the ${JOB_NAME} Cloud Run Job" \
+    --log-filter="resource.type=\"cloud_run_job\" AND resource.labels.job_name=\"${JOB_NAME}\" AND textPayload=\"Sync finished successfully.\"" \
+    --project="${NONPROD_PROJECT}"
+
+  # Absence alert — fires if no successful sync in 25 hours.
+  ABSENCE_POLICY_EXISTS=$(gcloud alpha monitoring policies list \
+    --filter="displayName='${JOB_NAME} sync not run in 25h'" \
+    --format="value(name)" \
+    --project="${NONPROD_PROJECT}" 2>/dev/null | head -1)
+
+  if [[ -z "${ABSENCE_POLICY_EXISTS}" ]]; then
+    ABSENCE_JSON=$(cat <<EOF
+{
+  "displayName": "${JOB_NAME} sync not run in 25h",
+  "documentation": {
+    "content": "The ${JOB_NAME} sync has not completed successfully in 25 hours. Check the scheduler: https://console.cloud.google.com/run/jobs?project=${NONPROD_PROJECT}",
+    "mimeType": "text/markdown"
+  },
+  "conditions": [{
+    "displayName": "No successful sync in last 25 hours",
+    "conditionAbsent": {
+      "filter": "metric.type=\"logging.googleapis.com/user/${SUCCESS_METRIC}\" AND resource.type=\"cloud_run_job\"",
+      "duration": "90000s",
+      "aggregations": [{"alignmentPeriod": "3600s", "perSeriesAligner": "ALIGN_COUNT"}]
+    }
+  }],
+  "combiner": "OR",
+  "notificationChannels": ["${CHANNEL_NAME}"]
+}
+EOF
+)
+    echo "${ABSENCE_JSON}" | gcloud alpha monitoring policies create \
+      --policy-from-file=- --project="${NONPROD_PROJECT}"
+    log "Absence alert policy created (fires if no sync in 25h)."
+  else
+    log "Absence alert policy already exists."
+  fi
+
 else
   log "No alert_email set in config.yaml — skipping monitoring setup."
   log "  Add 'alert_email: you@example.com' to config.yaml and re-run to enable alerts."
+fi
+
+# ── 7. Secret Manager — nonprod DB password ───────────────────────────────────
+SECRET_NAME="${JOB_NAME}-nonprod-db-password"
+SECRET_EXISTS=$(gcloud secrets describe "${SECRET_NAME}" \
+  --project="${NONPROD_PROJECT}" --format="value(name)" 2>/dev/null || true)
+
+if [[ -z "${SECRET_EXISTS}" ]]; then
+  log "Creating Secret Manager secret for nonprod DB password..."
+  gcloud services enable secretmanager.googleapis.com --project="${NONPROD_PROJECT}"
+  gcloud secrets create "${SECRET_NAME}" \
+    --replication-policy=automatic \
+    --project="${NONPROD_PROJECT}"
+
+  # Grant the job SA read access to the secret.
+  gcloud secrets add-iam-policy-binding "${SECRET_NAME}" \
+    --member="serviceAccount:${JOB_SA}" \
+    --role="roles/secretmanager.secretAccessor" \
+    --project="${NONPROD_PROJECT}"
+
+  log ""
+  log "⚠️  Secret created but has no value yet. Set the nonprod postgres password:"
+  log "  echo -n 'YOUR_NONPROD_PASSWORD' | gcloud secrets versions add ${SECRET_NAME} --data-file=- --project=${NONPROD_PROJECT}"
+  log ""
+  log "Then update the Cloud Run Job to enable password reset after each sync:"
+  log "  gcloud run jobs update ${JOB_NAME} --region=${RUN_REGION} --project=${NONPROD_PROJECT} \\"
+  log "    --update-env-vars=NONPROD_DB_PASSWORD_SECRET=projects/${NONPROD_PROJECT}/secrets/${SECRET_NAME}"
+else
+  log "Secret Manager secret ${SECRET_NAME} already exists."
 fi
 
 log ""

@@ -19,6 +19,7 @@ from main import (
     OperationTimeout,
     SyncError,
     _extract_op_name,
+    _fetch_secret,
     _raise_for_http_error,
     _validate_instance_name,
     _validate_project_id,
@@ -26,6 +27,7 @@ from main import (
     create_backup,
     delete_backup,
     load_config,
+    reset_nonprod_password,
     restore_to_nonprod,
     wait_for_operation,
 )
@@ -634,3 +636,88 @@ class TestExceptions:
     def test_operation_timeout_is_subclass_of_sync_error(self):
         err = OperationTimeout("op", 60)
         assert isinstance(err, SyncError)
+
+
+# ---------------------------------------------------------------------------
+# reset_nonprod_password / _fetch_secret
+# ---------------------------------------------------------------------------
+
+class TestResetNonprodPassword:
+
+    def _make_service(self):
+        svc = MagicMock()
+        svc.users.return_value.update.return_value.execute.return_value = {
+            "name": "operations/user-update-op"
+        }
+        svc.operations.return_value.get.return_value.execute.return_value = {
+            "status": "DONE"
+        }
+        return svc
+
+    def test_happy_path_resets_password(self):
+        svc = self._make_service()
+        with patch("main._fetch_secret", return_value="s3cr3t"):
+            reset_nonprod_password(svc, FAST_CFG, "projects/proj/secrets/nonprod-pw")
+
+        _, kwargs = svc.users.return_value.update.call_args
+        assert kwargs["name"] == "postgres"
+        assert kwargs["body"]["password"] == "s3cr3t"
+        assert kwargs["project"] == FAST_CFG.nonprod_project
+        assert kwargs["instance"] == FAST_CFG.nonprod_instance
+
+    def test_secret_fetch_failure_raises_sync_error(self):
+        svc = self._make_service()
+        with patch("main._fetch_secret", side_effect=Exception("permission denied")):
+            with pytest.raises(SyncError) as exc_info:
+                reset_nonprod_password(svc, FAST_CFG, "projects/proj/secrets/nonprod-pw")
+        assert "permission denied" in str(exc_info.value)
+        assert exc_info.value.exit_code == 2
+
+    def test_http_403_on_user_update_raises_sync_error(self):
+        svc = MagicMock()
+        svc.users.return_value.update.return_value.execute.side_effect = make_http_error(403)
+        with patch("main._fetch_secret", return_value="s3cr3t"):
+            with pytest.raises(SyncError) as exc_info:
+                reset_nonprod_password(svc, FAST_CFG, "projects/proj/secrets/nonprod-pw")
+        assert exc_info.value.exit_code == 2
+
+    def test_http_404_on_user_update_raises_sync_error(self):
+        svc = MagicMock()
+        svc.users.return_value.update.return_value.execute.side_effect = make_http_error(404)
+        with patch("main._fetch_secret", return_value="s3cr3t"):
+            with pytest.raises(SyncError):
+                reset_nonprod_password(svc, FAST_CFG, "projects/proj/secrets/nonprod-pw")
+
+    def test_polls_operation_after_user_update(self):
+        """users.update returns an operation — it must be polled to completion."""
+        svc = self._make_service()
+        with patch("main._fetch_secret", return_value="pw"):
+            reset_nonprod_password(svc, FAST_CFG, "projects/proj/secrets/s")
+        svc.operations.return_value.get.assert_called()
+
+
+class TestFetchSecret:
+
+    def test_calls_secret_manager_client(self):
+        mock_client = MagicMock()
+        mock_response = MagicMock()
+        mock_response.payload.data = b"my-secret-password"
+        mock_client.access_secret_version.return_value = mock_response
+
+        with patch("main.secretmanager.SecretManagerServiceClient",
+                   return_value=mock_client):
+            result = _fetch_secret("projects/p/secrets/s")
+
+        assert result == "my-secret-password"
+        mock_client.access_secret_version.assert_called_once_with(
+            request={"name": "projects/p/secrets/s/versions/latest"}
+        )
+
+    def test_propagates_exception_on_failure(self):
+        mock_client = MagicMock()
+        mock_client.access_secret_version.side_effect = Exception("not found")
+
+        with patch("main.secretmanager.SecretManagerServiceClient",
+                   return_value=mock_client):
+            with pytest.raises(Exception, match="not found"):
+                _fetch_secret("projects/p/secrets/s")

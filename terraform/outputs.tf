@@ -32,3 +32,13 @@ output "logs_command" {
   description = "gcloud command to tail sync logs."
   value       = "gcloud logging read 'resource.type=cloud_run_job AND resource.labels.job_name=${var.job_name}' --project=${var.nonprod_project_id} --limit=50 --order=desc"
 }
+
+output "nonprod_db_password_secret" {
+  description = "Secret Manager resource name for the nonprod DB password. Set the initial value with: gcloud secrets versions add JOB_NAME-nonprod-db-password --data-file=-"
+  value       = google_secret_manager_secret.nonprod_db_password.name
+}
+
+output "set_nonprod_password_command" {
+  description = "Command to set the initial nonprod DB password in Secret Manager."
+  value       = "echo -n 'YOUR_NONPROD_PASSWORD' | gcloud secrets versions add ${google_secret_manager_secret.nonprod_db_password.secret_id} --data-file=- --project=${var.nonprod_project_id}"
+}
