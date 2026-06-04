@@ -32,6 +32,9 @@ locals {
 
   # Comma-separated "project:instance" string consumed by main.py.
   nonprod_targets_env = join(",", [for t in local.targets : "${t.project}:${t.instance}"])
+
+  # On-demand mode (schedule == "on-demand" or empty) creates no scheduler.
+  create_scheduler = !contains(["", "on-demand"], var.schedule)
 }
 
 # ── Guard: detect a prior deploy.sh deployment ────────────────────────────────
@@ -114,6 +117,7 @@ resource "google_project_iam_member" "job_target_cloudsql_admin" {
 # ── Scheduler service account ─────────────────────────────────────────────────
 
 resource "google_service_account" "scheduler" {
+  count        = local.create_scheduler ? 1 : 0
   account_id   = "${var.job_name}-scheduler"
   display_name = "CloudSQL Sync Scheduler"
   project      = var.nonprod_project_id
@@ -122,9 +126,10 @@ resource "google_service_account" "scheduler" {
 }
 
 resource "google_project_iam_member" "scheduler_run_invoker" {
+  count   = local.create_scheduler ? 1 : 0
   project = var.nonprod_project_id
   role    = "roles/run.invoker"
-  member  = "serviceAccount:${google_service_account.scheduler.email}"
+  member  = "serviceAccount:${google_service_account.scheduler[0].email}"
 }
 
 # ── Cloud Run Job ─────────────────────────────────────────────────────────────
@@ -195,6 +200,7 @@ resource "google_cloud_run_v2_job" "sync" {
 # ── Cloud Scheduler ───────────────────────────────────────────────────────────
 
 resource "google_cloud_scheduler_job" "nightly" {
+  count     = local.create_scheduler ? 1 : 0
   name      = "${var.job_name}-nightly"
   region    = var.region
   project   = var.nonprod_project_id
@@ -206,7 +212,7 @@ resource "google_cloud_scheduler_job" "nightly" {
     uri         = "https://${var.region}-run.googleapis.com/apis/run.googleapis.com/v1/namespaces/${var.nonprod_project_id}/jobs/${var.job_name}:run"
 
     oauth_token {
-      service_account_email = google_service_account.scheduler.email
+      service_account_email = google_service_account.scheduler[0].email
       scope                 = "https://www.googleapis.com/auth/cloud-platform"
     }
   }

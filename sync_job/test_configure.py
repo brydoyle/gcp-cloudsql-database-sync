@@ -16,8 +16,15 @@ from configure import (
     _check_prod_ne_nonprod,
     _load_yaml,
     _prompt,
+    _prompt_schedule,
     _write_yaml,
     _write_tfvars,
+    _build_cron,
+    _describe_schedule,
+    _parse_hhmm,
+    _validate_schedule_value,
+    DEFAULT_SCHEDULE,
+    ON_DEMAND,
     FIELDS,
     GCP_REGIONS,
     _PROJECT_ID_RE,
@@ -527,3 +534,126 @@ class TestUseLatestExistingBackup:
             assert "use_latest_existing_backup = false" in content
         finally:
             os.unlink(path)
+
+
+# ---------------------------------------------------------------------------
+# Schedule builder helpers
+# ---------------------------------------------------------------------------
+
+class TestParseHHMM:
+
+    @pytest.mark.parametrize("text,expected", [
+        ("00:00", (0, 0)),
+        ("2:30", (2, 30)),
+        ("02:05", (2, 5)),
+        ("23:59", (23, 59)),
+        ("9:00", (9, 0)),
+    ])
+    def test_valid(self, text, expected):
+        assert _parse_hhmm(text) == expected
+
+    @pytest.mark.parametrize("text", ["24:00", "12:60", "noon", "", "2", "2:5:1", "-1:00"])
+    def test_invalid(self, text):
+        assert _parse_hhmm(text) is None
+
+
+class TestBuildCron:
+
+    def test_daily(self):
+        assert _build_cron(2, 0) == "0 2 * * *"
+
+    def test_daily_with_minutes(self):
+        assert _build_cron(2, 30) == "30 2 * * *"
+
+    def test_weekly_saturday(self):
+        # Saturday = 6
+        assert _build_cron(23, 0, weekday=6) == "0 23 * * 6"
+
+    def test_weekdays(self):
+        assert _build_cron(2, 0, weekdays_only=True) == "0 2 * * 1-5"
+
+
+class TestValidateScheduleValue:
+
+    def test_accepts_on_demand(self):
+        assert _validate_schedule_value("on-demand") is None
+        assert _validate_schedule_value("ON-DEMAND") is None
+
+    def test_accepts_cron(self):
+        assert _validate_schedule_value("0 23 * * 6") is None
+
+    @pytest.mark.parametrize("v", ["weekly", "every night", "", "0 2 * *"])
+    def test_rejects_other(self, v):
+        assert _validate_schedule_value(v) is not None
+
+
+class TestDescribeSchedule:
+
+    def test_on_demand(self):
+        assert "on-demand" in _describe_schedule("on-demand")
+        assert "on-demand" in _describe_schedule("")
+
+    def test_cron(self):
+        assert "0 23 * * 6" in _describe_schedule("0 23 * * 6")
+
+
+class TestDefaultSchedule:
+
+    def test_default_is_saturday_night(self):
+        # 0 23 * * 6  →  minute 0, hour 23, any day-of-month/month, Saturday(6)
+        assert DEFAULT_SCHEDULE == "0 23 * * 6"
+
+
+# ---------------------------------------------------------------------------
+# _prompt_schedule (interactive)
+# ---------------------------------------------------------------------------
+
+class TestPromptSchedule:
+
+    def test_non_interactive_returns_current(self):
+        assert _prompt_schedule("0 2 * * *", non_interactive=True) == "0 2 * * *"
+
+    def test_non_interactive_defaults_when_empty(self):
+        assert _prompt_schedule(None, non_interactive=True) == DEFAULT_SCHEDULE
+
+    def test_non_interactive_invalid_exits(self):
+        with pytest.raises(SystemExit):
+            _prompt_schedule("not-a-schedule", non_interactive=True)
+
+    def test_keep_current_on_yes(self):
+        with patch("builtins.input", side_effect=["y"]):
+            assert _prompt_schedule("0 9 * * 1", non_interactive=False) == "0 9 * * 1"
+
+    def test_weekly_default_path(self):
+        # No current; choose weekly (1), Saturday, 23:00 → default.
+        with patch("builtins.input", side_effect=["1", "saturday", "23:00"]):
+            assert _prompt_schedule(None, non_interactive=False) == "0 23 * * 6"
+
+    def test_weekly_other_day_and_time(self):
+        with patch("builtins.input", side_effect=["1", "monday", "06:30"]):
+            assert _prompt_schedule(None, non_interactive=False) == "30 6 * * 1"
+
+    def test_daily_with_time(self):
+        with patch("builtins.input", side_effect=["2", "02:00"]):
+            assert _prompt_schedule(None, non_interactive=False) == "0 2 * * *"
+
+    def test_weekdays(self):
+        with patch("builtins.input", side_effect=["3", "07:15"]):
+            assert _prompt_schedule(None, non_interactive=False) == "15 7 * * 1-5"
+
+    def test_on_demand(self):
+        with patch("builtins.input", side_effect=["4"]):
+            assert _prompt_schedule(None, non_interactive=False) == ON_DEMAND
+
+    def test_custom_cron(self):
+        with patch("builtins.input", side_effect=["5", "*/30 * * * *"]):
+            assert _prompt_schedule(None, non_interactive=False) == "*/30 * * * *"
+
+    def test_invalid_time_reprompts(self):
+        # daily → bad time → good time
+        with patch("builtins.input", side_effect=["2", "25:00", "03:00"]):
+            assert _prompt_schedule(None, non_interactive=False) == "0 3 * * *"
+
+    def test_invalid_weekday_reprompts(self):
+        with patch("builtins.input", side_effect=["1", "funday", "saturday", "23:00"]):
+            assert _prompt_schedule(None, non_interactive=False) == "0 23 * * 6"
