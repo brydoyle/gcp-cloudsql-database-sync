@@ -129,6 +129,7 @@ gcloud run jobs deploy "${JOB_NAME}" \
   --service-account="${JOB_SA}" \
   --task-timeout="7200s" \
   --max-retries=1 \
+  --labels="managed-by=deploy-sh" \
   --set-env-vars="\
 PROD_PROJECT_ID=${PROD_PROJECT},\
 PROD_INSTANCE_NAME=${PROD_INSTANCE},\

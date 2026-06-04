@@ -34,6 +34,38 @@ locals {
   nonprod_targets_env = join(",", [for t in local.targets : "${t.project}:${t.instance}"])
 }
 
+# ── Guard: detect a prior deploy.sh deployment ────────────────────────────────
+#
+# deploy.sh and this module manage the SAME resources — running both against
+# one project causes ownership collisions. deploy.sh labels its Cloud Run job
+# `managed-by=deploy-sh`; if we find that label, fail loudly with guidance.
+#
+# Semantics:
+#   - Fresh project (no job yet): the data source 404s. Inside a `check` block
+#     that surfaces as a one-time WARNING, not an error — apply proceeds.
+#   - Terraform-managed job: no `managed-by=deploy-sh` label → assertion passes.
+#   - deploy.sh-managed job: label present → assertion FAILS with instructions.
+check "no_bash_deploy" {
+  data "google_cloud_run_v2_job" "existing" {
+    name     = var.job_name
+    location = var.region
+    project  = var.nonprod_project_id
+  }
+
+  assert {
+    condition = lookup(
+      data.google_cloud_run_v2_job.existing.effective_labels, "managed-by", ""
+    ) != "deploy-sh"
+    error_message = join(" ", [
+      "Cloud Run job '${var.job_name}' was deployed by deploy.sh",
+      "(label managed-by=deploy-sh). Terraform and deploy.sh must not manage",
+      "the same resources. Either import the existing resources into Terraform",
+      "state, or tear down the deploy.sh resources first.",
+      "See README → 'Choosing a deploy path'.",
+    ])
+  }
+}
+
 # ── APIs ─────────────────────────────────────────────────────────────────────
 
 resource "google_project_service" "nonprod_apis" {

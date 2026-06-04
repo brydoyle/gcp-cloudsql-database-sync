@@ -81,6 +81,8 @@ python3 configure.py
 
 The wizard prompts for your project IDs, instance names, region, schedule, and alert email. It writes `config.yaml` (for the bash path) and `../terraform/terraform.tfvars` (for the Terraform path) in one step.
 
+> **Pick one deploy path — not both.** `deploy.sh` and Terraform manage the *same* resources. Running both against one project causes ownership collisions. See [Choosing a deploy path](#choosing-a-deploy-path).
+
 ### 2a. Deploy with bash
 
 ```bash
@@ -166,6 +168,42 @@ The job restores into existing instances, so a freshly-provisioned target starts
   Trivially scriptable in a Makefile or post-apply CI step. Keeps provisioning (state) and sync (action) cleanly separated.
 
 - **Optional — sync at `terraform apply`** via a `local-exec` provisioner. See [`terraform/examples/initial-sync.tf.example`](terraform/examples/initial-sync.tf.example). Convenient for "day-0", but it couples `apply` to a 7–30 min data operation, needs `gcloud` on the apply host, and runs once on create (not idempotent infra). Read the caveats in the file before using it.
+
+---
+
+## Choosing a deploy path
+
+`deploy.sh` and Terraform manage the **same** control-plane resources (service accounts, Cloud Run Job, scheduler, IAM, monitoring, secret). They are **mutually exclusive** — pick one owner per project.
+
+| | `deploy.sh` | Terraform |
+|---|---|---|
+| Best for | Quick POCs, single-dev, throwaway envs | Shared / long-lived / prod-adjacent envs |
+| State & drift | None — imperative | Tracked; `plan` shows drift |
+| Change review | Diff the script | PR review on infra |
+| Owns | Same resources | Same resources |
+
+> The Cloud SQL **instances** are owned by neither — you create them separately (manually or via [`terraform/examples/target-instance.tf.example`](terraform/examples/target-instance.tf.example)). Only the control plane is contested.
+
+### Built-in guard
+
+To prevent accidentally running both, `deploy.sh` labels its Cloud Run Job `managed-by=deploy-sh`, and Terraform has a `check` block that **fails `plan`/`apply` with a clear message** if it finds a job carrying that label. (On a fresh project the check emits a one-time "job not found" warning — that's expected and harmless.)
+
+### Migrating bash → Terraform (when a POC graduates)
+
+The contested resources are cheap and stateless, so you have two safe options:
+
+1. **Import** (no downtime) — bring each existing resource into Terraform state:
+   ```bash
+   cd terraform
+   terraform import google_service_account.job          projects/CTRL/serviceAccounts/cloudsql-sync@CTRL.iam.gserviceaccount.com
+   terraform import google_service_account.scheduler    projects/CTRL/serviceAccounts/cloudsql-sync-scheduler@CTRL.iam.gserviceaccount.com
+   terraform import google_cloud_run_v2_job.sync         projects/CTRL/locations/REGION/jobs/cloudsql-sync
+   terraform import google_cloud_scheduler_job.nightly   projects/CTRL/locations/REGION/jobs/cloudsql-sync-nightly
+   # ...repeat for the IAM, logging metric, notification channel, alert policy, secret
+   terraform plan   # should show no/minimal changes once imported
+   ```
+
+2. **Tear down & re-apply** (brief control-plane gap, simplest) — delete the bash-created control-plane resources (the SQL instances are untouched), then `terraform apply` fresh. Re-set the Secret Manager value afterward.
 
 ---
 
