@@ -127,14 +127,12 @@ resource "google_cloud_run_v2_job" "sync" {
           name  = "OPERATION_TIMEOUT_SECONDS"
           value = tostring(var.task_timeout_seconds)
         }
+        # Pass the secret RESOURCE NAME (not the value) — main.py fetches the
+        # secret itself via the Secret Manager client using the job SA's
+        # secretAccessor binding. This keeps both deploy paths consistent.
         env {
-          name = "NONPROD_DB_PASSWORD_SECRET"
-          value_source {
-            secret_key_ref {
-              secret  = google_secret_manager_secret.nonprod_db_password.secret_id
-              version = "latest"
-            }
-          }
+          name  = "NONPROD_DB_PASSWORD_SECRET"
+          value = google_secret_manager_secret.nonprod_db_password.id
         }
       }
     }
@@ -331,15 +329,6 @@ resource "google_secret_manager_secret_iam_member" "job_secret_accessor" {
   member    = "serviceAccount:${google_service_account.job.email}"
 }
 
-# Grant the job SA permission to reset Cloud SQL users on nonprod.
-resource "google_project_iam_member" "job_nonprod_cloudsql_user_admin" {
-  project = var.nonprod_project_id
-  role    = "roles/cloudsql.admin"  # already granted; listed here for documentation
-  member  = "serviceAccount:${google_service_account.job.email}"
-
-  # No-op if cloudsql.admin is already bound — kept for explicit dependency
-  # tracking and to allow narrowing to a custom role later.
-  lifecycle {
-    ignore_changes = [role]
-  }
-}
+# Note: the job SA's existing roles/cloudsql.admin on the nonprod project
+# (job_nonprod_cloudsql_admin above) already includes cloudsql.users.update,
+# which is what reset_nonprod_password needs — no extra binding required.
