@@ -149,7 +149,7 @@ resource "google_cloud_run_v2_job" "sync" {
 
 resource "google_cloud_scheduler_job" "nightly" {
   name      = "${var.job_name}-nightly"
-  location  = var.region
+  region    = var.region
   project   = var.nonprod_project_id
   schedule  = var.schedule
   time_zone = var.timezone
@@ -185,9 +185,9 @@ resource "google_logging_metric" "sync_failure" {
   ])
 
   metric_descriptor {
-    metric_kind = "DELTA"
-    value_type  = "INT64"
-    unit        = "1"
+    metric_kind  = "DELTA"
+    value_type   = "INT64"
+    unit         = "1"
     display_name = "${var.job_name} failed executions"
   }
 
@@ -218,7 +218,7 @@ resource "google_monitoring_alert_policy" "sync_failure" {
 
     condition_threshold {
       filter          = "metric.type=\"logging.googleapis.com/user/${google_logging_metric.sync_failure.name}\" AND resource.type=\"cloud_run_job\""
-      duration        = "0s"   # alert immediately on first occurrence
+      duration        = "0s" # alert immediately on first occurrence
       comparison      = "COMPARISON_GT"
       threshold_value = 0
 
@@ -233,7 +233,7 @@ resource "google_monitoring_alert_policy" "sync_failure" {
 
   alert_strategy {
     notification_rate_limit {
-      period = "3600s"   # at most one alert per hour
+      period = "3600s" # at most one alert per hour
     }
   }
 
