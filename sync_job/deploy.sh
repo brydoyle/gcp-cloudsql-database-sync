@@ -3,34 +3,76 @@
 # Run from the sync_job/ directory. Safe to re-run (idempotent).
 #
 # Prerequisites:
-#   gcloud CLI authenticated with sufficient IAM in both projects.
+#   - gcloud CLI authenticated with sufficient IAM in both projects
+#   - config.yaml present (run: python3 configure.py)
 #
 # Usage:
-#   Edit the variables below, then: bash deploy.sh
+#   python3 configure.py   # first-time setup
+#   bash deploy.sh         # deploy
 
 set -euo pipefail
 
-# ── Edit these ──────────────────────────────────────────────────────────────
-PROD_PROJECT="bright-modem-498401-f6"
-PROD_INSTANCE="production-postgresql"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CONFIG_FILE="${SCRIPT_DIR}/config.yaml"
 
-NONPROD_PROJECT="nonproduction-498401"
-NONPROD_INSTANCE="nonproduction-postgresql"
+# ── Load config.yaml ─────────────────────────────────────────────────────────
+if [[ ! -f "${CONFIG_FILE}" ]]; then
+  echo "ERROR: config.yaml not found. Run 'python3 configure.py' first."
+  exit 1
+fi
 
-# Where to deploy the Cloud Run Job.
-RUN_REGION="us-central1"
-JOB_NAME="cloudsql-sync"
+log() { echo "[deploy] $*"; }
+
+# Parse config.yaml once — output all required values on separate lines,
+# in a fixed order. This avoids spawning 8+ separate python3 processes.
+_raw_config=$(python3 -c "
+import sys
+try:
+    import yaml
+    with open('${CONFIG_FILE}') as f:
+        cfg = yaml.safe_load(f) or {}
+except ImportError:
+    cfg = {}
+    with open('${CONFIG_FILE}') as f:
+        for line in f:
+            line = line.strip()
+            if line and not line.startswith('#') and ':' in line:
+                k, _, v = line.partition(':')
+                cfg[k.strip()] = v.strip().strip(chr(39) + chr(34))
+
+required = ['prod_project_id','prod_instance_name','nonprod_project_id',
+            'nonprod_instance_name','region','schedule','timezone','job_name']
+missing = [k for k in required if not cfg.get(k)]
+if missing:
+    for k in missing:
+        print(f'ERROR: {k} is not set in config.yaml', file=sys.stderr)
+    sys.exit(1)
+
+# Output required keys then optional alert_email (may be empty)
+for k in required + ['alert_email']:
+    print(cfg.get(k, ''))
+") || { log "ERROR: Failed to load config.yaml — run 'python3 configure.py' first."; exit 1; }
+
+# Assign values by line position (matches the order printed above)
+PROD_PROJECT=$(    sed -n '1p' <<< "${_raw_config}")
+PROD_INSTANCE=$(   sed -n '2p' <<< "${_raw_config}")
+NONPROD_PROJECT=$( sed -n '3p' <<< "${_raw_config}")
+NONPROD_INSTANCE=$(sed -n '4p' <<< "${_raw_config}")
+RUN_REGION=$(      sed -n '5p' <<< "${_raw_config}")
+SCHEDULE=$(        sed -n '6p' <<< "${_raw_config}")
+SCHEDULER_TIMEZONE=$(sed -n '7p' <<< "${_raw_config}")
+JOB_NAME=$(        sed -n '8p' <<< "${_raw_config}")
+ALERT_EMAIL=$(     sed -n '9p' <<< "${_raw_config}")
+
 IMAGE="gcr.io/${NONPROD_PROJECT}/${JOB_NAME}"
-
-# Cloud Scheduler — nightly at 02:00 UTC by default.
-SCHEDULE="0 2 * * *"
-SCHEDULER_TIMEZONE="UTC"
-# ────────────────────────────────────────────────────────────────────────────
-
 JOB_SA="${JOB_NAME}@${NONPROD_PROJECT}.iam.gserviceaccount.com"
 SCHEDULER_SA="${JOB_NAME}-scheduler@${NONPROD_PROJECT}.iam.gserviceaccount.com"
 
-log() { echo "[deploy] $*"; }
+log "Loaded config:"
+log "  Prod:    ${PROD_PROJECT} / ${PROD_INSTANCE}"
+log "  Nonprod: ${NONPROD_PROJECT} / ${NONPROD_INSTANCE}"
+log "  Region:  ${RUN_REGION}"
+log "  Schedule: ${SCHEDULE} (${SCHEDULER_TIMEZONE})"
 
 # ── 1. Enable required APIs ──────────────────────────────────────────────────
 log "Enabling APIs..."
@@ -49,8 +91,6 @@ gcloud iam service-accounts create "${JOB_NAME}" \
   --display-name="CloudSQL Sync Job" \
   --project="${NONPROD_PROJECT}" 2>/dev/null || true
 
-# Wait for the service account to propagate before binding IAM policies.
-# GCP has an eventual-consistency delay after SA creation.
 log "Waiting for service account to propagate..."
 for i in $(seq 1 10); do
   if gcloud iam service-accounts describe "${JOB_SA}" --project="${NONPROD_PROJECT}" &>/dev/null; then
@@ -65,13 +105,11 @@ for i in $(seq 1 10); do
   sleep 3
 done
 
-# Create backups on prod.
 gcloud projects add-iam-policy-binding "${PROD_PROJECT}" \
   --member="serviceAccount:${JOB_SA}" \
   --role="roles/cloudsql.admin" \
   --condition=None
 
-# Read prod backups + trigger restore on nonprod.
 gcloud projects add-iam-policy-binding "${NONPROD_PROJECT}" \
   --member="serviceAccount:${JOB_SA}" \
   --role="roles/cloudsql.admin" \
@@ -144,8 +182,165 @@ gcloud scheduler jobs update http "${JOB_NAME}-nightly" \
   --oauth-service-account-email="${SCHEDULER_SA}" \
   --project="${NONPROD_PROJECT}"
 
+# ── 6. Monitoring & Alerting ──────────────────────────────────────────────────
+
+if [[ -n "${ALERT_EMAIL}" ]]; then
+  log "Enabling monitoring APIs..."
+  gcloud services enable monitoring.googleapis.com logging.googleapis.com \
+    --project="${NONPROD_PROJECT}"
+
+  METRIC_NAME="${JOB_NAME}-failure"
+
+  log "Creating log-based failure metric..."
+  gcloud logging metrics create "${METRIC_NAME}" \
+    --description="Failed executions of the ${JOB_NAME} Cloud Run Job" \
+    --log-filter="resource.type=\"cloud_run_job\" AND resource.labels.job_name=\"${JOB_NAME}\" AND textPayload=~\"Container called exit\([1-9][0-9]*\)\"" \
+    --project="${NONPROD_PROJECT}" 2>/dev/null || \
+  gcloud logging metrics update "${METRIC_NAME}" \
+    --description="Failed executions of the ${JOB_NAME} Cloud Run Job" \
+    --log-filter="resource.type=\"cloud_run_job\" AND resource.labels.job_name=\"${JOB_NAME}\" AND textPayload=~\"Container called exit\([1-9][0-9]*\)\"" \
+    --project="${NONPROD_PROJECT}"
+
+  log "Creating email notification channel for ${ALERT_EMAIL}..."
+  # Filter by display name (label filtering is unreliable across gcloud versions).
+  # Redirect stderr to /dev/null to prevent gcloud self-update noise from
+  # contaminating the captured output.
+  CHANNEL_NAME=$(gcloud beta monitoring channels list \
+    --filter="displayName='CloudSQL Sync Alerts'" \
+    --format="value(name)" \
+    --project="${NONPROD_PROJECT}" 2>/dev/null | head -1)
+
+  if [[ -z "${CHANNEL_NAME}" ]]; then
+    CHANNEL_NAME=$(gcloud beta monitoring channels create \
+      --display-name="CloudSQL Sync Alerts" \
+      --type=email \
+      --channel-labels="email_address=${ALERT_EMAIL}" \
+      --format="value(name)" \
+      --project="${NONPROD_PROJECT}" 2>/dev/null)
+    log "Created notification channel: ${CHANNEL_NAME}"
+  else
+    log "Reusing existing notification channel: ${CHANNEL_NAME}"
+  fi
+
+  log "Creating failure alert policy..."
+  POLICY_EXISTS=$(gcloud alpha monitoring policies list \
+    --filter="displayName='${JOB_NAME} sync failed'" \
+    --format="value(name)" \
+    --project="${NONPROD_PROJECT}" 2>/dev/null | head -1)
+
+  if [[ -z "${POLICY_EXISTS}" ]]; then
+    POLICY_JSON=$(cat <<EOF
+{
+  "displayName": "${JOB_NAME} sync failed",
+  "documentation": {
+    "content": "The ${JOB_NAME} sync job failed. Check logs: https://console.cloud.google.com/run/jobs?project=${NONPROD_PROJECT}",
+    "mimeType": "text/markdown"
+  },
+  "conditions": [{
+    "displayName": "Sync job exited with non-zero code",
+    "conditionThreshold": {
+      "filter": "metric.type=\"logging.googleapis.com/user/${METRIC_NAME}\" AND resource.type=\"cloud_run_job\"",
+      "comparison": "COMPARISON_GT",
+      "thresholdValue": 0,
+      "duration": "0s",
+      "aggregations": [{"alignmentPeriod": "60s", "perSeriesAligner": "ALIGN_COUNT"}]
+    }
+  }],
+  "alertStrategy": { "notificationRateLimit": { "period": "3600s" } },
+  "combiner": "OR",
+  "notificationChannels": ["${CHANNEL_NAME}"]
+}
+EOF
+)
+    echo "${POLICY_JSON}" | gcloud alpha monitoring policies create \
+      --policy-from-file=- --project="${NONPROD_PROJECT}"
+    log "Failure alert policy created."
+  else
+    log "Failure alert policy already exists."
+  fi
+
+  # Success metric — fires when "Sync finished successfully." is logged.
+  SUCCESS_METRIC="${JOB_NAME}-success"
+  log "Creating log-based success metric..."
+  gcloud logging metrics create "${SUCCESS_METRIC}" \
+    --description="Successful executions of the ${JOB_NAME} Cloud Run Job" \
+    --log-filter="resource.type=\"cloud_run_job\" AND resource.labels.job_name=\"${JOB_NAME}\" AND textPayload=\"Sync finished successfully.\"" \
+    --project="${NONPROD_PROJECT}" 2>/dev/null || \
+  gcloud logging metrics update "${SUCCESS_METRIC}" \
+    --description="Successful executions of the ${JOB_NAME} Cloud Run Job" \
+    --log-filter="resource.type=\"cloud_run_job\" AND resource.labels.job_name=\"${JOB_NAME}\" AND textPayload=\"Sync finished successfully.\"" \
+    --project="${NONPROD_PROJECT}"
+
+  # Absence alert — fires if no successful sync in 25 hours.
+  ABSENCE_POLICY_EXISTS=$(gcloud alpha monitoring policies list \
+    --filter="displayName='${JOB_NAME} sync not run in 25h'" \
+    --format="value(name)" \
+    --project="${NONPROD_PROJECT}" 2>/dev/null | head -1)
+
+  if [[ -z "${ABSENCE_POLICY_EXISTS}" ]]; then
+    ABSENCE_JSON=$(cat <<EOF
+{
+  "displayName": "${JOB_NAME} sync not run in 25h",
+  "documentation": {
+    "content": "The ${JOB_NAME} sync has not completed successfully in 25 hours. Check the scheduler: https://console.cloud.google.com/run/jobs?project=${NONPROD_PROJECT}",
+    "mimeType": "text/markdown"
+  },
+  "conditions": [{
+    "displayName": "No successful sync in last 25 hours",
+    "conditionAbsent": {
+      "filter": "metric.type=\"logging.googleapis.com/user/${SUCCESS_METRIC}\" AND resource.type=\"cloud_run_job\"",
+      "duration": "90000s",
+      "aggregations": [{"alignmentPeriod": "3600s", "perSeriesAligner": "ALIGN_COUNT"}]
+    }
+  }],
+  "combiner": "OR",
+  "notificationChannels": ["${CHANNEL_NAME}"]
+}
+EOF
+)
+    echo "${ABSENCE_JSON}" | gcloud alpha monitoring policies create \
+      --policy-from-file=- --project="${NONPROD_PROJECT}"
+    log "Absence alert policy created (fires if no sync in 25h)."
+  else
+    log "Absence alert policy already exists."
+  fi
+
+else
+  log "No alert_email set in config.yaml — skipping monitoring setup."
+  log "  Add 'alert_email: you@example.com' to config.yaml and re-run to enable alerts."
+fi
+
+# ── 7. Secret Manager — nonprod DB password ───────────────────────────────────
+SECRET_NAME="${JOB_NAME}-nonprod-db-password"
+SECRET_EXISTS=$(gcloud secrets describe "${SECRET_NAME}" \
+  --project="${NONPROD_PROJECT}" --format="value(name)" 2>/dev/null || true)
+
+if [[ -z "${SECRET_EXISTS}" ]]; then
+  log "Creating Secret Manager secret for nonprod DB password..."
+  gcloud services enable secretmanager.googleapis.com --project="${NONPROD_PROJECT}"
+  gcloud secrets create "${SECRET_NAME}" \
+    --replication-policy=automatic \
+    --project="${NONPROD_PROJECT}"
+
+  # Grant the job SA read access to the secret.
+  gcloud secrets add-iam-policy-binding "${SECRET_NAME}" \
+    --member="serviceAccount:${JOB_SA}" \
+    --role="roles/secretmanager.secretAccessor" \
+    --project="${NONPROD_PROJECT}"
+
+  log ""
+  log "⚠️  Secret created but has no value yet. Set the nonprod postgres password:"
+  log "  echo -n 'YOUR_NONPROD_PASSWORD' | gcloud secrets versions add ${SECRET_NAME} --data-file=- --project=${NONPROD_PROJECT}"
+  log ""
+  log "Then update the Cloud Run Job to enable password reset after each sync:"
+  log "  gcloud run jobs update ${JOB_NAME} --region=${RUN_REGION} --project=${NONPROD_PROJECT} \\"
+  log "    --update-env-vars=NONPROD_DB_PASSWORD_SECRET=projects/${NONPROD_PROJECT}/secrets/${SECRET_NAME}"
+else
+  log "Secret Manager secret ${SECRET_NAME} already exists."
+fi
+
 log ""
-log "Done. Schedule: ${SCHEDULE} ${SCHEDULER_TIMEZONE}"
+log "Done. Schedule: ${SCHEDULE} (${SCHEDULER_TIMEZONE})"
 log ""
 log "Manual run:"
 log "  gcloud run jobs execute ${JOB_NAME} --region=${RUN_REGION} --project=${NONPROD_PROJECT}"

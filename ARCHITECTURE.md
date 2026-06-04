@@ -1,0 +1,175 @@
+# Architecture — GCP CloudSQL Cross-Project Sync
+
+## Context
+
+Teams running production workloads on Cloud SQL PostgreSQL need non-production environments that reflect current production data. Manual database refreshes are error-prone, inconsistent, and create compliance risk if done ad-hoc.
+
+This solution automates a nightly one-way sync from prod to non-prod across GCP project boundaries.
+
+---
+
+## Goals
+
+- **Automated** — no human intervention for routine refreshes
+- **Native GCP** — no external tools, no VMs, no GCS bucket
+- **Cross-project** — prod and non-prod live in separate GCP projects (billing isolation, IAM isolation)
+- **Observable** — structured logs, alert on failure
+- **Safe** — guards against accidental prod-to-prod restore, Free Trial restrictions, and misconfigurations caught at startup
+
+---
+
+## High-level design
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  nonprod project                                                │
+│                                                                 │
+│  Cloud Scheduler ──(cron)──▶ Cloud Run Job                      │
+│                               (cloudsql-sync SA)                │
+│                                      │                          │
+│          ┌───────────────────────────┼──────────────────────┐   │
+│          │                           │                      │   │
+│          ▼                           ▼                      ▼   │
+│  ┌──────────────┐          ┌──────────────────┐   ┌────────────┐│
+│  │ Cloud SQL    │          │  Cloud SQL       │   │ Cloud      ││
+│  │ Admin API    │          │  Admin API       │   │ Monitoring ││
+│  │ (prod proj)  │          │  (nonprod proj)  │   │ + Alerting ││
+│  └──────────────┘          └──────────────────┘   └────────────┘│
+│          │                           │                           │
+└──────────┼───────────────────────────┼───────────────────────────┘
+           │                           │
+┌──────────▼──────────┐   ┌────────────▼────────────┐
+│  prod project       │   │  nonprod project        │
+│                     │   │                         │
+│  Cloud SQL          │   │  Cloud SQL              │
+│  (production-db)    │   │  (nonprod-db)           │
+│                     │   │                         │
+└─────────────────────┘   └─────────────────────────┘
+```
+
+### Sync flow (step by step)
+
+| Step | API call | Description |
+|---|---|---|
+| 1 | `backupRuns.insert` (prod) | Create an on-demand snapshot of prod instance |
+| 2 | `operations.get` (prod) | Poll until backup is `DONE` |
+| 3 | `instances.restoreBackup` (nonprod) | Restore using a cross-project backup reference |
+| 4 | `operations.get` (nonprod) | Poll until restore is `DONE` |
+| 5 | `backupRuns.delete` (prod) | Delete the on-demand backup to avoid quota accumulation |
+
+Step 5 runs in a `finally` block — it always executes even if the restore fails, and its own failure is non-fatal (warns only) so a cleanup error never masks a successful sync.
+
+---
+
+## Key design decisions
+
+### Native backup/restore vs. pg_dump/restore
+
+| Approach | Pros | Cons |
+|---|---|---|
+| **Native backup/restore** (chosen) | No GCS bucket, no psql tooling, no compute required inside the DB | Full instance restore only; cannot restore individual databases or tables |
+| pg_dump / pg_restore via Cloud Run | Flexible — table-level, schema-only, data masking possible | Requires psql tooling in container, GCS bucket, more IAM complexity |
+
+**Decision:** Native backup/restore for the POC. If table-level granularity or data masking is needed in production, pg_dump/restore can be added as an alternative path.
+
+### Cloud Run Job vs. Cloud Functions vs. GCE VM
+
+| Option | Chosen | Reason |
+|---|---|---|
+| **Cloud Run Job** | ✅ | Serverless, scales to zero, built-in retry, max 24h timeout |
+| Cloud Functions | ❌ | 9-minute max timeout — too short for large databases |
+| GCE VM | ❌ | Always-on cost, requires OS patching, over-engineered for a periodic job |
+
+### Error handling — exceptions vs. sys.exit()
+
+The poller (`wait_for_operation`) raises typed exceptions (`SyncError`, `OperationTimeout`) rather than calling `sys.exit()`. This allows `delete_backup()` — which is non-fatal cleanup — to catch errors naturally without the `except SystemExit` antipattern. `sys.exit()` is only called at the top-level boundary in `__main__`.
+
+### Config validation — fail fast, report all errors
+
+All environment variables are validated at startup before any API call is made. The validator collects all errors and reports them together, so a misconfigured environment reports every problem in a single run rather than one at a time.
+
+### Two deployment paths — bash and Terraform
+
+| Path | When to use |
+|---|---|
+| `deploy.sh` | Quick deploys, POCs, single-developer setups |
+| Terraform | Team environments, code review for infra changes, drift detection, state tracking |
+
+Both paths read from `config.yaml` / `terraform.tfvars` generated by `configure.py`. The config wizard is the single source of truth for values.
+
+---
+
+## Component inventory
+
+| Component | Project | Purpose |
+|---|---|---|
+| Cloud Run Job `cloudsql-sync` | nonprod | Runs the sync container |
+| Cloud Scheduler `cloudsql-sync-nightly` | nonprod | Triggers the job on cron |
+| Service Account `cloudsql-sync@nonprod` | nonprod | Job identity; has `cloudsql.admin` in both projects |
+| Service Account `cloudsql-sync-scheduler@nonprod` | nonprod | Scheduler identity; has `run.invoker` in nonprod |
+| Log-based metric `cloudsql-sync-failure` | nonprod | Counts non-zero exit codes |
+| Notification channel (email) | nonprod | Delivers failure alerts |
+| Alert policy `cloudsql-sync sync failed` | nonprod | Fires on first failure, rate-limited to 1/hour |
+| Container image `gcr.io/nonprod/cloudsql-sync` | nonprod | Built by Cloud Build from `sync_job/` |
+
+---
+
+## Exit codes
+
+| Code | Meaning |
+|---|---|
+| `0` | Success |
+| `1` | Configuration error (missing/invalid env vars, bad credentials) |
+| `2` | Cloud SQL API error (HTTP 4xx/5xx, operation failed) |
+| `3` | Operation timed out |
+| `4` | Unexpected error (missing field in API response, unhandled exception) |
+
+---
+
+## Production gaps (POC → Production)
+
+The following are known gaps from POC to a production-hardened deployment. They are out of scope for the POC but straightforward to close.
+
+### 1. Networking — Public IP
+
+**Current state:** Both Cloud SQL instances use public IP addresses.
+
+**Production fix:** Use Private IP with VPC peering. The Cloud Run Job connects via a Serverless VPC Access connector. At corporate scale, the existing Dedicated Interconnect already provides private connectivity — route the VPC connector through the correct subnet.
+
+**Terraform path:** Add `google_compute_network`, `google_vpc_access_connector`, and set `private_ip_address` on both SQL instances.
+
+---
+
+### 2. Secrets — Manual password management
+
+**Current state:** The postgres user password is set manually via `gcloud sql users set-password`. After each sync, the nonprod password is overwritten with prod's password.
+
+**Production fix:** Store the password in **Secret Manager**. Reference it as a secret env var in the Cloud Run Job. Set a rotation policy. After each sync, optionally run a post-sync step to reset the nonprod password to a different value stored in a separate secret.
+
+**Terraform path:** Add `google_secret_manager_secret`, `google_secret_manager_secret_version`, and reference via `secret_environment_variables` in the Cloud Run Job.
+
+---
+
+### 3. Monitoring — Metrics only, no SLO
+
+**Current state:** An alert fires on any failure. There is no SLO, no success rate tracking, and no latency metric.
+
+**Production fix:** Add a log-based metric for successful syncs and define an SLO (e.g., "sync succeeds ≥ 6 out of 7 nights"). Add a duration metric to track restore time trends.
+
+---
+
+### 4. Data masking (if required)
+
+**Current state:** Prod data is copied as-is to nonprod.
+
+**Production fix:** If nonprod contains PII that must be masked, switch from native restore to pg_dump/restore and add a post-restore SQL step that updates sensitive columns. Alternatively, use a separate Cloud SQL instance with column-level masking policies.
+
+---
+
+## Security notes
+
+- Project IDs and instance names are validated against strict regex at startup to prevent log injection
+- The prod==nonprod guard prevents the job from restoring prod onto itself even if misconfigured
+- Service accounts follow least-privilege — they have no permissions outside Cloud SQL and Cloud Run
+- `config.yaml` and `terraform.tfvars` are gitignored — real project IDs are never committed
+- The job SA has no key file — it uses Workload Identity (Cloud Run's built-in identity)

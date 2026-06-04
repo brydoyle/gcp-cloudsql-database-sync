@@ -9,6 +9,7 @@ Flow:
   4. Restore that backup to the non-prod instance (cross-project)
   5. Wait for the restore to finish
   6. Delete the on-demand backup to avoid quota accumulation
+  7. (Optional) Reset the nonprod postgres password from Secret Manager
 
 No GCS bucket or dump files involved — entirely managed by Cloud SQL.
 
@@ -33,6 +34,7 @@ import time
 import googleapiclient.discovery
 from google.auth import default
 from google.auth.exceptions import DefaultCredentialsError
+from google.cloud import secretmanager
 from googleapiclient.errors import HttpError
 
 logging.basicConfig(
@@ -337,11 +339,17 @@ def create_backup(service, cfg: Config) -> int:
     log.info("Backup operation started: %s", op_name)
     result = wait_for_operation(service, cfg.prod_project, op_name, cfg)
 
+    # The Cloud SQL API returns the backup ID in backupContext.backupId.
+    # Older API versions used targetId — check both for compatibility.
+    raw_id = (
+        (result.get("backupContext") or {}).get("backupId")
+        or result.get("targetId")
+    )
     try:
-        backup_id = int(result.get("targetId") or "")
+        backup_id = int(raw_id or "")
     except (ValueError, TypeError) as exc:
         raise SyncError(
-            f"Operation {op_name} completed but targetId is missing or non-integer: {result}",
+            f"Operation {op_name} completed but backup ID is missing or non-integer: {result}",
             exit_code=4,
         ) from exc
 
@@ -429,11 +437,71 @@ def delete_backup(service, backup_id: int, cfg: Config) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Secret Manager — nonprod password reset
+# ---------------------------------------------------------------------------
+
+def _fetch_secret(secret_resource_name: str) -> str:
+    """Fetch the latest version of a Secret Manager secret."""
+    client = secretmanager.SecretManagerServiceClient()
+    name = f"{secret_resource_name}/versions/latest"
+    response = client.access_secret_version(request={"name": name})
+    return response.payload.data.decode("utf-8")
+
+
+def reset_nonprod_password(service, cfg: Config, secret_resource_name: str) -> None:
+    """Reset the nonprod postgres user password to the value in Secret Manager.
+
+    After a restore the nonprod instance has prod's password. This step
+    resets it to a known, separately-managed credential so nonprod apps
+    continue to work without reconfiguration.
+
+    Uses the Cloud SQL Admin API (no direct DB connection required).
+    """
+    log.info(
+        "Resetting nonprod postgres password from Secret Manager secret: %s",
+        secret_resource_name,
+    )
+    try:
+        password = _fetch_secret(secret_resource_name)
+    except Exception as exc:  # noqa: BLE001
+        raise SyncError(
+            f"Failed to read secret {secret_resource_name}: {exc}"
+        ) from exc
+
+    try:
+        op = (
+            service.users()
+            .update(
+                project=cfg.nonprod_project,
+                instance=cfg.nonprod_instance,
+                name="postgres",
+                body={"name": "postgres", "password": password},
+            )
+            .execute(num_retries=3)
+        )
+    except HttpError as exc:
+        _raise_for_http_error(
+            exc,
+            f"resetting postgres password on {cfg.nonprod_project}/{cfg.nonprod_instance}",
+        )
+
+    # users.update returns an Operation — poll until done.
+    op_name = _extract_op_name(op, "users.update")
+    wait_for_operation(service, cfg.nonprod_project, op_name, cfg)
+    log.info("Nonprod postgres password reset successfully.")
+
+
+# ---------------------------------------------------------------------------
 # Entrypoint
 # ---------------------------------------------------------------------------
 
 def main() -> None:
     cfg = load_config()
+    # Optional: reset nonprod DB password after restore using Secret Manager.
+    # Set NONPROD_DB_PASSWORD_SECRET to the full secret resource name:
+    #   projects/PROJECT/secrets/SECRET_NAME
+    password_secret = os.getenv("NONPROD_DB_PASSWORD_SECRET", "").strip()
+
     log.info(
         "Starting sync: %s/%s → %s/%s  (region: %s)",
         cfg.prod_project, cfg.prod_instance,
@@ -441,8 +509,9 @@ def main() -> None:
         cfg.region,
     )
     log.info(
-        "Config: poll_interval=%ds  timeout=%ds",
+        "Config: poll_interval=%ds  timeout=%ds  password_reset=%s",
         cfg.poll_interval, cfg.operation_timeout,
+        "enabled" if password_secret else "disabled",
     )
 
     service = build_sqladmin()
@@ -453,6 +522,12 @@ def main() -> None:
     finally:
         # Always attempt cleanup so backups don't accumulate even on failure.
         delete_backup(service, backup_id, cfg)
+
+    # Reset nonprod password after successful restore — runs outside the
+    # finally block so a password reset failure is fatal (exit 2) rather
+    # than silently swallowed.
+    if password_secret:
+        reset_nonprod_password(service, cfg, password_secret)
 
     log.info("Sync finished successfully.")
 

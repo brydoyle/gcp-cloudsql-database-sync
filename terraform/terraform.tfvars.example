@@ -1,0 +1,21 @@
+# CloudSQL Sync — Terraform Variables
+# Copy to terraform.tfvars and fill in your values, or run:
+#   python3 ../sync_job/configure.py   (generates this file automatically)
+
+prod_project_id       = "your-prod-project-id"
+prod_instance_name    = "your-prod-instance-name"
+
+nonprod_project_id    = "your-nonprod-project-id"
+nonprod_instance_name = "your-nonprod-instance-name"
+
+region     = "us-central1"
+job_name   = "cloudsql-sync"
+schedule   = "0 2 * * *"
+timezone   = "UTC"
+
+# Build the image first:
+#   gcloud builds submit sync_job/ --tag=gcr.io/YOUR_NONPROD_PROJECT/cloudsql-sync
+container_image = "gcr.io/your-nonprod-project-id/cloudsql-sync:latest"
+
+# Email to notify when the sync job fails
+alert_email = "your-team@example.com"

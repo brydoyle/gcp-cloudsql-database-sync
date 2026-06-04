@@ -1,0 +1,19 @@
+# CloudSQL Sync Configuration
+# Copy this file to config.yaml and fill in your values, or run:
+#   python3 configure.py
+
+prod_project_id: your-prod-project-id
+prod_instance_name: your-prod-instance-name
+
+nonprod_project_id: your-nonprod-project-id
+nonprod_instance_name: your-nonprod-instance-name
+
+region: us-central1
+
+# Cron schedule — default is nightly at 02:00 UTC
+# See https://crontab.guru to build a schedule
+schedule: "0 2 * * *"
+timezone: UTC
+
+# Cloud Run Job name — change only if you need multiple sync jobs
+job_name: cloudsql-sync

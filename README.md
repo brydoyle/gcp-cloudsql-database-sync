@@ -1,100 +1,200 @@
-# CloudSQL Cross-Project Sync (Native Snapshots)
+# GCP CloudSQL Cross-Project Sync
 
-Nightly sync of a production PostgreSQL CloudSQL instance to a non-production instance
-in a different GCP project using Cloud SQL's native backup/restore API.
+Nightly sync of a **production** PostgreSQL CloudSQL instance to a **non-production** instance in a different GCP project — using Cloud SQL's native backup/restore API. No GCS bucket, no dump files, no VMs.
 
-## Architecture
+> **Status:** POC — proven working. Production gaps (Private IP, Secret Manager) are documented in [ARCHITECTURE.md](ARCHITECTURE.md).
+
+---
+
+## How it works
 
 ```
-Cloud Scheduler
-      │ (nightly trigger)
-      ▼
-Cloud Run Job  (sync_job/main.py)
-      │
-      ├─1─▶ backupRuns.insert  (prod project)
-      │         → on-demand snapshot of prod instance
-      │
-      └─2─▶ instances.restoreBackup  (nonprod project)
-                ← cross-project reference to prod backup
+Cloud Scheduler  ──(nightly 02:00 UTC)──▶  Cloud Run Job
+                                                │
+                                    ┌───────────┴───────────┐
+                                    ▼                       ▼
+                            prod project             nonprod project
+                         backupRuns.insert      instances.restoreBackup
+                         (create snapshot)      (restore from prod backup)
+                                    │                       │
+                                    └───────────┬───────────┘
+                                                ▼
+                                        backupRuns.delete
+                                        (cleanup snapshot)
 ```
 
-No GCS bucket, no dump files — entirely managed by Cloud SQL.
+Total runtime: ~7–30 minutes depending on database size.
 
 ---
 
-## Files
+## Repository layout
 
-| File | Purpose |
-|---|---|
-| `sync_job/main.py` | Cloud Run Job entrypoint |
-| `sync_job/Dockerfile` | Container definition |
-| `sync_job/requirements.txt` | Python dependencies |
-| `sync_job/deploy.sh` | One-shot deploy script |
-
----
-
-## Quick Start
-
-1. **Edit `deploy.sh`** — fill in `PROD_PROJECT`, `PROD_INSTANCE`, `NONPROD_PROJECT`, `NONPROD_INSTANCE`.
-
-2. **Run from `sync_job/`:**
-   ```bash
-   cd sync_job
-   bash deploy.sh
-   ```
-
-3. **Test a manual run:**
-   ```bash
-   gcloud run jobs execute cloudsql-sync \
-     --region=us-central1 \
-     --project=your-nonprod-project-id
-   ```
-
-4. **Watch logs:**
-   ```bash
-   gcloud logging read \
-     'resource.type=cloud_run_job AND resource.labels.job_name=cloudsql-sync' \
-     --project=your-nonprod-project-id \
-     --limit=50
-   ```
+```
+.
+├── sync_job/
+│   ├── main.py              # Cloud Run Job — sync logic
+│   ├── configure.py         # Interactive config wizard
+│   ├── deploy.sh            # Bash deploy (reads config.yaml)
+│   ├── Dockerfile
+│   ├── requirements.txt
+│   ├── config.yaml.example  # Config template (copy → config.yaml)
+│   ├── test_main.py         # 94 unit tests for main.py
+│   └── test_configure.py    # 61 unit tests for configure.py
+├── terraform/
+│   ├── main.tf              # All GCP resources
+│   ├── variables.tf         # Inputs with validation
+│   ├── outputs.tf           # Useful outputs + gcloud commands
+│   ├── versions.tf          # Provider pins
+│   └── terraform.tfvars.example
+├── README.md                # This file
+├── ARCHITECTURE.md          # Design decisions and trade-offs
+├── DEPLOY_CHECKLIST.md      # Pre/post deployment verification
+└── RUNBOOK.md               # Operational runbook for on-call
+```
 
 ---
 
-## IAM Summary
+## Quick start
 
-The deploy script configures all of these automatically.
+### Prerequisites
 
-| Principal | Project | Role | Reason |
+- `gcloud` CLI authenticated with Owner or sufficient IAM in both projects
+- Both Cloud SQL instances must use the same **major PostgreSQL version**
+- Non-prod instance must have equal or **larger** machine tier than prod
+- Prod project must be on a **paid billing account** (Free Trial blocks backup API)
+
+### 1. Configure
+
+```bash
+cd sync_job
+python3 configure.py
+```
+
+The wizard prompts for your project IDs, instance names, region, schedule, and alert email. It writes `config.yaml` (for the bash path) and `../terraform/terraform.tfvars` (for the Terraform path) in one step.
+
+### 2a. Deploy with bash
+
+```bash
+bash deploy.sh
+```
+
+### 2b. Deploy with Terraform
+
+```bash
+# Build the container image first
+gcloud builds submit sync_job/ \
+  --tag=gcr.io/YOUR_NONPROD_PROJECT/cloudsql-sync \
+  --project=YOUR_NONPROD_PROJECT
+
+cd terraform
+terraform init
+terraform apply
+```
+
+### 3. Run a manual sync
+
+```bash
+gcloud run jobs execute cloudsql-sync \
+  --region=us-central1 \
+  --project=YOUR_NONPROD_PROJECT \
+  --wait
+```
+
+### 4. Watch logs
+
+```bash
+gcloud logging read \
+  'resource.type=cloud_run_job AND resource.labels.job_name=cloudsql-sync' \
+  --project=YOUR_NONPROD_PROJECT \
+  --order=desc \
+  --freshness=10m \
+  --format='value(timestamp,textPayload)'
+```
+
+---
+
+## Configuration reference
+
+All values are set via `config.yaml` (generated by `configure.py`). The wizard validates every field before saving.
+
+| Field | Required | Default | Description |
 |---|---|---|---|
-| Job SA | prod | `roles/cloudsql.admin` | Create, read, and delete on-demand backup |
-| Job SA | nonprod | `roles/cloudsql.admin` | Trigger cross-project restore |
-| Scheduler SA | nonprod | `roles/run.invoker` | Trigger Cloud Run Job |
+| `prod_project_id` | ✅ | — | GCP project containing the prod Cloud SQL instance |
+| `prod_instance_name` | ✅ | — | Cloud SQL instance name in prod |
+| `nonprod_project_id` | ✅ | — | GCP project containing the non-prod instance |
+| `nonprod_instance_name` | ✅ | — | Cloud SQL instance name in non-prod |
+| `region` | ✅ | `us-central1` | GCP region for Cloud Run Job and Scheduler |
+| `schedule` | ✅ | `0 2 * * *` | Cron schedule (02:00 UTC nightly) |
+| `timezone` | ✅ | `UTC` | Timezone for the schedule |
+| `job_name` | ✅ | `cloudsql-sync` | Cloud Run Job name |
+| `alert_email` | ☐ | — | Email to notify on failure (skips monitoring if blank) |
 
-For least-privilege, replace `roles/cloudsql.admin` with a custom role containing only:
+The following are also set as environment variables on the Cloud Run Job:
+
+| Variable | Default | Range |
+|---|---|---|
+| `POLL_INTERVAL_SECONDS` | `15` | 1–3600 |
+| `OPERATION_TIMEOUT_SECONDS` | `7200` | 60–86400 |
+
+---
+
+## IAM
+
+Both deploy paths configure all bindings automatically.
+
+| Principal | Project | Role | Purpose |
+|---|---|---|---|
+| Job SA (`cloudsql-sync@nonprod`) | **prod** | `roles/cloudsql.admin` | Create / delete on-demand backup |
+| Job SA | **nonprod** | `roles/cloudsql.admin` | Trigger cross-project restore |
+| Scheduler SA (`cloudsql-sync-scheduler@nonprod`) | **nonprod** | `roles/run.invoker` | Trigger Cloud Run Job |
+
+**Least-privilege custom role** (optional, replaces `cloudsql.admin`):
 - Prod: `cloudsql.backupRuns.create`, `cloudsql.backupRuns.get`, `cloudsql.backupRuns.delete`, `cloudsql.operations.get`
 - Nonprod: `cloudsql.instances.restoreBackup`, `cloudsql.operations.get`
 
 ---
 
-## Configuration
+## Monitoring & alerting
 
-Environment variables set on the Cloud Run Job:
+When `alert_email` is set, `deploy.sh` / Terraform creates:
 
-| Variable | Description |
-|---|---|
-| `PROD_PROJECT_ID` | GCP project containing the prod instance |
-| `PROD_INSTANCE_NAME` | Cloud SQL instance name |
-| `NONPROD_PROJECT_ID` | GCP project containing the non-prod instance |
-| `NONPROD_INSTANCE_NAME` | Cloud SQL instance name |
-| `POLL_INTERVAL_SECONDS` | Operation poll frequency (default: 15) |
-| `OPERATION_TIMEOUT_SECONDS` | Max wait per operation (default: 7200) |
+1. A **log-based metric** counting executions where the container exits with a non-zero code
+2. An **email notification channel**
+3. An **alert policy** that fires immediately on first failure, rate-limited to once per hour
 
 ---
 
-## Caveats
+## Testing
 
-- **Destructive:** restore overwrites the entire non-prod instance. No rollback.
-- **Downtime:** the non-prod instance is unavailable during the restore.
-- **Instance tier must match:** the non-prod instance must have the same or larger machine type and disk size as prod, or the restore will fail.
-- **Same major PostgreSQL version required** for cross-instance restore.
-- On-demand backups created by this job count against your Cloud SQL backup retention quota.
+```bash
+# Install dependencies
+pip install pytest google-api-python-client google-auth
+
+# Run all 155 tests
+pytest sync_job/test_main.py sync_job/test_configure.py -v
+```
+
+---
+
+## Known limitations
+
+| Limitation | Notes |
+|---|---|
+| **Destructive** | Restore overwrites the entire non-prod instance with no rollback |
+| **Downtime** | Non-prod is unavailable during restore (~7–30 min) |
+| **Version match required** | Non-prod must be the same major PostgreSQL version as prod |
+| **Tier match required** | Non-prod must have equal or larger machine tier than prod |
+| **Public IP** | POC uses public IP. Production should use Private IP + VPC connector |
+| **Manual password** | DB passwords are set manually. Production should use Secret Manager |
+
+See [ARCHITECTURE.md](ARCHITECTURE.md) for the full design rationale and production path.
+
+---
+
+## Docs
+
+| Document | Audience | Purpose |
+|---|---|---|
+| [ARCHITECTURE.md](ARCHITECTURE.md) | Engineers | Design decisions, trade-offs, production path |
+| [DEPLOY_CHECKLIST.md](DEPLOY_CHECKLIST.md) | Deployers | Pre/post deployment verification steps |
+| [RUNBOOK.md](RUNBOOK.md) | On-call | Diagnosing and fixing failures |
