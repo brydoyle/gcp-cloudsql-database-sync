@@ -195,13 +195,13 @@ if [[ -n "${ALERT_EMAIL}" ]]; then
     --project="${NONPROD_PROJECT}"
 
   log "Creating email notification channel for ${ALERT_EMAIL}..."
-  CHANNEL_NAME=$(gcloud monitoring channels list \
+  CHANNEL_NAME=$(gcloud beta monitoring channels list \
     --filter="type=email AND labels.email_address=${ALERT_EMAIL}" \
     --format="value(name)" \
     --project="${NONPROD_PROJECT}" | head -1)
 
   if [[ -z "${CHANNEL_NAME}" ]]; then
-    CHANNEL_NAME=$(gcloud monitoring channels create \
+    CHANNEL_NAME=$(gcloud beta monitoring channels create \
       --display-name="CloudSQL Sync Alerts" \
       --type=email \
       --channel-labels="email_address=${ALERT_EMAIL}" \
