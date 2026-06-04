@@ -144,49 +144,58 @@ USE_LATEST_EXISTING_BACKUP=${USE_LATEST_BACKUP}" \
   --project="${NONPROD_PROJECT}"
 
 # ── 5. Cloud Scheduler ───────────────────────────────────────────────────────
-log "Creating scheduler service account ${SCHEDULER_SA}..."
-gcloud iam service-accounts create "${JOB_NAME}-scheduler" \
-  --display-name="CloudSQL Sync Scheduler" \
-  --project="${NONPROD_PROJECT}" 2>/dev/null || true
+# On-demand mode: no scheduler. Remove any existing one (so switching an
+# already-scheduled job to on-demand actually takes effect) and skip the rest.
+if [ "${SCHEDULE}" = "on-demand" ]; then
+  log "Schedule is on-demand — no Cloud Scheduler will be created."
+  gcloud scheduler jobs delete "${JOB_NAME}-nightly" \
+    --location="${RUN_REGION}" --project="${NONPROD_PROJECT}" --quiet 2>/dev/null \
+    && log "Removed existing scheduler job (now on-demand)." || true
+else
+  log "Creating scheduler service account ${SCHEDULER_SA}..."
+  gcloud iam service-accounts create "${JOB_NAME}-scheduler" \
+    --display-name="CloudSQL Sync Scheduler" \
+    --project="${NONPROD_PROJECT}" 2>/dev/null || true
 
-log "Waiting for scheduler service account to propagate..."
-for i in $(seq 1 10); do
-  if gcloud iam service-accounts describe "${SCHEDULER_SA}" --project="${NONPROD_PROJECT}" &>/dev/null; then
-    log "Scheduler service account ready."
-    break
-  fi
-  if [ "$i" -eq 10 ]; then
-    log "ERROR: Service account ${SCHEDULER_SA} did not become available after 30s."
-    exit 1
-  fi
-  log "  not ready yet, retrying in 3s... (attempt ${i}/10)"
-  sleep 3
-done
+  log "Waiting for scheduler service account to propagate..."
+  for i in $(seq 1 10); do
+    if gcloud iam service-accounts describe "${SCHEDULER_SA}" --project="${NONPROD_PROJECT}" &>/dev/null; then
+      log "Scheduler service account ready."
+      break
+    fi
+    if [ "$i" -eq 10 ]; then
+      log "ERROR: Service account ${SCHEDULER_SA} did not become available after 30s."
+      exit 1
+    fi
+    log "  not ready yet, retrying in 3s... (attempt ${i}/10)"
+    sleep 3
+  done
 
-gcloud projects add-iam-policy-binding "${NONPROD_PROJECT}" \
-  --member="serviceAccount:${SCHEDULER_SA}" \
-  --role="roles/run.invoker" \
-  --condition=None
+  gcloud projects add-iam-policy-binding "${NONPROD_PROJECT}" \
+    --member="serviceAccount:${SCHEDULER_SA}" \
+    --role="roles/run.invoker" \
+    --condition=None
 
-JOB_URI="https://${RUN_REGION}-run.googleapis.com/apis/run.googleapis.com/v1/namespaces/${NONPROD_PROJECT}/jobs/${JOB_NAME}:run"
+  JOB_URI="https://${RUN_REGION}-run.googleapis.com/apis/run.googleapis.com/v1/namespaces/${NONPROD_PROJECT}/jobs/${JOB_NAME}:run"
 
-log "Creating/updating Cloud Scheduler job..."
-gcloud scheduler jobs create http "${JOB_NAME}-nightly" \
-  --location="${RUN_REGION}" \
-  --schedule="${SCHEDULE}" \
-  --time-zone="${SCHEDULER_TIMEZONE}" \
-  --uri="${JOB_URI}" \
-  --http-method=POST \
-  --oauth-service-account-email="${SCHEDULER_SA}" \
-  --project="${NONPROD_PROJECT}" 2>/dev/null || \
-gcloud scheduler jobs update http "${JOB_NAME}-nightly" \
-  --location="${RUN_REGION}" \
-  --schedule="${SCHEDULE}" \
-  --time-zone="${SCHEDULER_TIMEZONE}" \
-  --uri="${JOB_URI}" \
-  --http-method=POST \
-  --oauth-service-account-email="${SCHEDULER_SA}" \
-  --project="${NONPROD_PROJECT}"
+  log "Creating/updating Cloud Scheduler job..."
+  gcloud scheduler jobs create http "${JOB_NAME}-nightly" \
+    --location="${RUN_REGION}" \
+    --schedule="${SCHEDULE}" \
+    --time-zone="${SCHEDULER_TIMEZONE}" \
+    --uri="${JOB_URI}" \
+    --http-method=POST \
+    --oauth-service-account-email="${SCHEDULER_SA}" \
+    --project="${NONPROD_PROJECT}" 2>/dev/null || \
+  gcloud scheduler jobs update http "${JOB_NAME}-nightly" \
+    --location="${RUN_REGION}" \
+    --schedule="${SCHEDULE}" \
+    --time-zone="${SCHEDULER_TIMEZONE}" \
+    --uri="${JOB_URI}" \
+    --http-method=POST \
+    --oauth-service-account-email="${SCHEDULER_SA}" \
+    --project="${NONPROD_PROJECT}"
+fi
 
 # ── 6. Monitoring & Alerting ──────────────────────────────────────────────────
 

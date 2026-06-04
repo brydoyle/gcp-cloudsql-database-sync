@@ -58,6 +58,60 @@ TIMEZONES = {
     "Asia/Tokyo", "Asia/Singapore", "Asia/Sydney", "Australia/Sydney",
 }
 
+# ---------------------------------------------------------------------------
+# Schedule presets / builder
+# ---------------------------------------------------------------------------
+
+# Sentinel meaning "no Cloud Scheduler — run on demand only".
+ON_DEMAND = "on-demand"
+
+# cron day-of-week numbers (0 = Sunday … 6 = Saturday).
+_WEEKDAYS = {
+    "sunday": 0, "monday": 1, "tuesday": 2, "wednesday": 3,
+    "thursday": 4, "friday": 5, "saturday": 6,
+}
+_WEEKDAY_BY_NUM = {v: k for k, v in _WEEKDAYS.items()}
+
+# Default: every Saturday night at 23:00.
+DEFAULT_SCHEDULE = "0 23 * * 6"
+
+_HHMM_RE = re.compile(r"^([01]?\d|2[0-3]):([0-5]?\d)$")
+
+
+def _parse_hhmm(text: str):
+    """Parse 'HH:MM' (24h) → (hour, minute), or None if invalid."""
+    m = _HHMM_RE.match(text.strip())
+    if not m:
+        return None
+    return int(m.group(1)), int(m.group(2))
+
+
+def _build_cron(hour: int, minute: int, *, weekday=None, weekdays_only=False) -> str:
+    """Assemble a 5-field cron string from time-of-day parts."""
+    if weekdays_only:
+        dow = "1-5"
+    elif weekday is not None:
+        dow = str(weekday)
+    else:
+        dow = "*"
+    return f"{minute} {hour} * * {dow}"
+
+
+def _validate_schedule_value(v: str):
+    """Accept the on-demand sentinel or any 5-field cron expression."""
+    if v.strip().lower() == ON_DEMAND:
+        return None
+    if _CRON_RE.match(v.strip()):
+        return None
+    return f"Must be a 5-field cron expression or '{ON_DEMAND}'"
+
+
+def _describe_schedule(value: str) -> str:
+    """Human-friendly one-liner for a stored schedule value (for summaries)."""
+    if not value or value.strip().lower() == ON_DEMAND:
+        return "on-demand (no scheduler)"
+    return f"cron: {value}"
+
 # Named validators — shared across the fields that use the same rule,
 # so the error message and regex live in exactly one place each.
 def _validate_project_id(v: str) -> Optional[str]:
@@ -105,14 +159,12 @@ FIELDS = [
         ),
     },
     {
-        "key":     "schedule",
-        "label":   "Sync schedule (cron format)",
-        "default": "0 2 * * *",
-        "hint":    "Default: 0 2 * * * = nightly at 02:00. See https://crontab.guru",
-        "validate": lambda v: (
-            "Must be a valid 5-field cron expression e.g. '0 2 * * *'"
-            if not _CRON_RE.match(v) else None
-        ),
+        "key":      "schedule",
+        "label":    "Sync schedule",
+        "default":  DEFAULT_SCHEDULE,  # every Saturday night
+        "validate": _validate_schedule_value,
+        # Prompted via the interactive _prompt_schedule() builder, not the
+        # generic text prompt — see main().
     },
     {
         "key":     "timezone",
@@ -241,6 +293,89 @@ container_image = "{image}"
 
 
 # ---------------------------------------------------------------------------
+# Schedule prompt (interactive builder)
+# ---------------------------------------------------------------------------
+
+def _ask(prompt_str: str, default: str = "") -> str:
+    """Single input line with EOF/Ctrl-C handling; returns default on blank."""
+    shown = f"{prompt_str} [{default}] " if default else f"{prompt_str} "
+    try:
+        raw = input(shown).strip()
+    except (EOFError, KeyboardInterrupt):
+        print("\nAborted.")
+        sys.exit(1)
+    return raw or default
+
+
+def _ask_time(default_hhmm: str) -> tuple:
+    """Prompt for an HH:MM time, re-asking until valid. Returns (hour, minute)."""
+    while True:
+        parsed = _parse_hhmm(_ask("    Time of day (HH:MM, 24-hour):", default_hhmm))
+        if parsed:
+            return parsed
+        print("    Invalid time — use HH:MM (e.g. 23:00, 02:30).")
+
+
+def _prompt_schedule(current: Optional[str], non_interactive: bool) -> str:
+    """Interactive schedule builder. Returns a cron string or the ON_DEMAND
+    sentinel. Far friendlier than asking for raw cron."""
+    default = current or DEFAULT_SCHEDULE
+
+    if non_interactive:
+        err = _validate_schedule_value(default)
+        if err:
+            print(f"  ERROR: schedule — {err} (got: {default!r})", file=sys.stderr)
+            sys.exit(1)
+        return default
+
+    print()
+    print("  Sync schedule")
+    if current:
+        keep = _ask(f"  Keep current ({_describe_schedule(current)})? [Y/n]", "Y")
+        if keep.lower() in ("y", "yes"):
+            return current
+
+    print("  How often should the sync run?")
+    print("    1) Weekly        (pick a day + time)   ← default")
+    print("    2) Daily         (pick a time)")
+    print("    3) Weekdays      (Mon–Fri, pick a time)")
+    print("    4) On-demand     (no scheduler — trigger manually / CI)")
+    print("    5) Custom cron   (enter a raw 5-field expression)")
+
+    choice = _ask("  Choose 1-5:", "1").lower()
+
+    # Weekly
+    if choice in ("1", "weekly", ""):
+        day = _ask("    Day of week:", "saturday").lower()
+        while day not in _WEEKDAYS:
+            print(f"    Pick one of: {', '.join(_WEEKDAYS)}")
+            day = _ask("    Day of week:", "saturday").lower()
+        hour, minute = _ask_time("23:00")  # "Saturday night"
+        return _build_cron(hour, minute, weekday=_WEEKDAYS[day])
+
+    # Daily
+    if choice in ("2", "daily"):
+        hour, minute = _ask_time("02:00")
+        return _build_cron(hour, minute)
+
+    # Weekdays
+    if choice in ("3", "weekdays"):
+        hour, minute = _ask_time("02:00")
+        return _build_cron(hour, minute, weekdays_only=True)
+
+    # On-demand
+    if choice in ("4", "on-demand", "none"):
+        return ON_DEMAND
+
+    # Custom cron
+    while True:
+        cron = _ask("    Raw cron (5 fields, e.g. '0 23 * * 6'):", DEFAULT_SCHEDULE)
+        if _CRON_RE.match(cron):
+            return cron
+        print("    Invalid cron — need 5 space-separated fields.")
+
+
+# ---------------------------------------------------------------------------
 # Prompt helper
 # ---------------------------------------------------------------------------
 
@@ -349,7 +484,10 @@ def main() -> None:
     config = {}
     for field in FIELDS:
         current = existing.get(field["key"])
-        config[field["key"]] = _prompt(field, current, non_interactive)
+        if field["key"] == "schedule":
+            config["schedule"] = _prompt_schedule(current, non_interactive)
+        else:
+            config[field["key"]] = _prompt(field, current, non_interactive)
 
     _check_prod_ne_nonprod(config)
 
@@ -359,7 +497,10 @@ def main() -> None:
         print("  Summary")
         print("=" * 60)
         for field in FIELDS:
-            print(f"  {field['label']:45s} {config[field['key']]}")
+            value = config[field["key"]]
+            if field["key"] == "schedule":
+                value = _describe_schedule(value)
+            print(f"  {field['label']:45s} {value}")
         print()
 
         try:

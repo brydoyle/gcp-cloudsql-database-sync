@@ -9,13 +9,13 @@ output "job_service_account" {
 }
 
 output "scheduler_service_account" {
-  description = "Email of the scheduler service account."
-  value       = google_service_account.scheduler.email
+  description = "Email of the scheduler service account (null when on-demand)."
+  value       = one(google_service_account.scheduler[*].email)
 }
 
 output "scheduler_job_name" {
-  description = "Cloud Scheduler job name."
-  value       = google_cloud_scheduler_job.nightly.name
+  description = "Cloud Scheduler job name (null when on-demand)."
+  value       = one(google_cloud_scheduler_job.nightly[*].name)
 }
 
 output "alert_policy_name" {
