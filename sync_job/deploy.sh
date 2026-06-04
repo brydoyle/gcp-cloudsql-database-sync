@@ -222,16 +222,38 @@ if [[ -n "${ALERT_EMAIL}" ]]; then
     --project="${NONPROD_PROJECT}" 2>/dev/null | head -1)
 
   if [[ -z "${POLICY_EXISTS}" ]]; then
-    gcloud alpha monitoring policies create \
-      --display-name="${JOB_NAME} sync failed" \
-      --condition-display-name="Sync job exited with non-zero code" \
-      --condition-filter="metric.type=\"logging.googleapis.com/user/${METRIC_NAME}\" AND resource.type=\"cloud_run_job\"" \
-      --condition-threshold-value=0 \
-      --condition-threshold-comparison=COMPARISON_GT \
-      --condition-aggregations="alignmentPeriod=60s,perSeriesAligner=ALIGN_COUNT" \
-      --duration=0s \
-      --notification-channels="${CHANNEL_NAME}" \
-      --documentation="The ${JOB_NAME} sync job failed. Check logs at https://console.cloud.google.com/run/jobs?project=${NONPROD_PROJECT}" \
+    # Write the policy as JSON — the gcloud CLI flag interface for threshold
+    # conditions is unreliable across alpha/beta versions.
+    POLICY_JSON=$(cat <<EOF
+{
+  "displayName": "${JOB_NAME} sync failed",
+  "documentation": {
+    "content": "The ${JOB_NAME} sync job failed. Check logs: https://console.cloud.google.com/run/jobs?project=${NONPROD_PROJECT}",
+    "mimeType": "text/markdown"
+  },
+  "conditions": [{
+    "displayName": "Sync job exited with non-zero code",
+    "conditionThreshold": {
+      "filter": "metric.type=\"logging.googleapis.com/user/${METRIC_NAME}\" AND resource.type=\"cloud_run_job\"",
+      "comparison": "COMPARISON_GT",
+      "thresholdValue": 0,
+      "duration": "0s",
+      "aggregations": [{
+        "alignmentPeriod": "60s",
+        "perSeriesAligner": "ALIGN_COUNT"
+      }]
+    }
+  }],
+  "alertStrategy": {
+    "notificationRateLimit": { "period": "3600s" }
+  },
+  "combiner": "OR",
+  "notificationChannels": ["${CHANNEL_NAME}"]
+}
+EOF
+)
+    echo "${POLICY_JSON}" | gcloud alpha monitoring policies create \
+      --policy-from-file=- \
       --project="${NONPROD_PROJECT}"
     log "Alert policy created — emails will be sent to ${ALERT_EMAIL} on failure."
   else
