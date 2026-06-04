@@ -170,6 +170,10 @@ resource "google_cloud_run_v2_job" "sync" {
           name  = "OPERATION_TIMEOUT_SECONDS"
           value = tostring(var.task_timeout_seconds)
         }
+        env {
+          name  = "USE_LATEST_EXISTING_BACKUP"
+          value = tostring(var.use_latest_existing_backup)
+        }
         # Pass the secret RESOURCE NAME (not the value) — main.py fetches the
         # secret itself via the Secret Manager client using the job SA's
         # secretAccessor binding. This keeps both deploy paths consistent.

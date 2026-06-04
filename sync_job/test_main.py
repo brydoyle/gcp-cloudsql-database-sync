@@ -19,6 +19,7 @@ from main import (
     OperationTimeout,
     SyncError,
     Target,
+    _bool_env,
     _extract_op_name,
     _fetch_secret,
     _parse_targets,
@@ -26,8 +27,10 @@ from main import (
     _validate_instance_name,
     _validate_project_id,
     _validate_region,
+    acquire_backup,
     create_backup,
     delete_backup,
+    get_latest_backup,
     load_config,
     reset_target_password,
     restore_to_target,
@@ -824,3 +827,141 @@ class TestFetchSecret:
                    return_value=mock_client):
             with pytest.raises(Exception, match="not found"):
                 _fetch_secret("projects/p/secrets/s")
+
+
+# ---------------------------------------------------------------------------
+# _bool_env
+# ---------------------------------------------------------------------------
+
+class TestBoolEnv:
+
+    @pytest.mark.parametrize("value", ["1", "true", "TRUE", "Yes", "on", "On"])
+    def test_truthy_values(self, value):
+        with patch.dict("os.environ", {"FLAG": value}, clear=True):
+            assert _bool_env("FLAG") is True
+
+    @pytest.mark.parametrize("value", ["0", "false", "no", "off", "nope", "2"])
+    def test_falsy_values(self, value):
+        with patch.dict("os.environ", {"FLAG": value}, clear=True):
+            assert _bool_env("FLAG") is False
+
+    def test_unset_uses_default(self):
+        with patch.dict("os.environ", {}, clear=True):
+            assert _bool_env("FLAG", default=False) is False
+            assert _bool_env("FLAG", default=True) is True
+
+    def test_empty_uses_default(self):
+        with patch.dict("os.environ", {"FLAG": "  "}, clear=True):
+            assert _bool_env("FLAG", default=True) is True
+
+
+# ---------------------------------------------------------------------------
+# load_config — use_latest_existing_backup
+# ---------------------------------------------------------------------------
+
+class TestLoadConfigBackupMode:
+
+    def test_defaults_to_create_new(self):
+        with patch.dict("os.environ", VALID_ENV, clear=True):
+            cfg = load_config()
+        assert cfg.use_latest_existing_backup is False
+
+    def test_enabled_via_env(self):
+        env = {**VALID_ENV, "USE_LATEST_EXISTING_BACKUP": "true"}
+        with patch.dict("os.environ", env, clear=True):
+            cfg = load_config()
+        assert cfg.use_latest_existing_backup is True
+
+    def test_explicit_false(self):
+        env = {**VALID_ENV, "USE_LATEST_EXISTING_BACKUP": "false"}
+        with patch.dict("os.environ", env, clear=True):
+            cfg = load_config()
+        assert cfg.use_latest_existing_backup is False
+
+
+# ---------------------------------------------------------------------------
+# get_latest_backup
+# ---------------------------------------------------------------------------
+
+class TestGetLatestBackup:
+
+    def _service_with_backups(self, items):
+        svc = MagicMock()
+        svc.backupRuns.return_value.list.return_value.execute.return_value = {"items": items}
+        return svc
+
+    def test_picks_most_recent_successful(self):
+        # Out of order on purpose — largest id (newest) must win.
+        svc = self._service_with_backups([
+            {"id": "100", "status": "SUCCESSFUL", "type": "AUTOMATED"},
+            {"id": "300", "status": "SUCCESSFUL", "type": "ON_DEMAND"},
+            {"id": "200", "status": "SUCCESSFUL", "type": "AUTOMATED"},
+        ])
+        assert get_latest_backup(svc, FAST_CFG) == 300
+
+    def test_skips_non_successful(self):
+        svc = self._service_with_backups([
+            {"id": "500", "status": "RUNNING"},
+            {"id": "400", "status": "FAILED"},
+            {"id": "150", "status": "SUCCESSFUL"},
+        ])
+        # 500/400 are newer but not SUCCESSFUL → must pick 150.
+        assert get_latest_backup(svc, FAST_CFG) == 150
+
+    def test_no_successful_raises_sync_error(self):
+        svc = self._service_with_backups([
+            {"id": "1", "status": "FAILED"},
+            {"id": "2", "status": "RUNNING"},
+        ])
+        with pytest.raises(SyncError) as exc_info:
+            get_latest_backup(svc, FAST_CFG)
+        assert "USE_LATEST_EXISTING_BACKUP" in str(exc_info.value)
+
+    def test_empty_list_raises_sync_error(self):
+        svc = self._service_with_backups([])
+        with pytest.raises(SyncError):
+            get_latest_backup(svc, FAST_CFG)
+
+    def test_http_error_raises_sync_error(self):
+        svc = MagicMock()
+        svc.backupRuns.return_value.list.return_value.execute.side_effect = make_http_error(403)
+        with pytest.raises(SyncError) as exc_info:
+            get_latest_backup(svc, FAST_CFG)
+        assert exc_info.value.exit_code == 2
+
+    def test_does_not_create_a_backup(self):
+        svc = self._service_with_backups([{"id": "9", "status": "SUCCESSFUL"}])
+        get_latest_backup(svc, FAST_CFG)
+        svc.backupRuns.return_value.insert.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# acquire_backup — ownership decision
+# ---------------------------------------------------------------------------
+
+class TestAcquireBackup:
+
+    def test_create_new_when_disabled(self):
+        cfg = Config(**{**FAST_CFG.__dict__, "use_latest_existing_backup": False})
+        svc = MagicMock()
+        svc.backupRuns.return_value.insert.return_value.execute.return_value = {
+            "name": "operations/backup-op"
+        }
+        svc.operations.return_value.get.return_value.execute.return_value = {
+            "status": "DONE", "targetId": "777",
+        }
+        backup_id, owned = acquire_backup(svc, cfg)
+        assert backup_id == 777
+        assert owned is True
+
+    def test_reuse_existing_when_enabled(self):
+        cfg = Config(**{**FAST_CFG.__dict__, "use_latest_existing_backup": True})
+        svc = MagicMock()
+        svc.backupRuns.return_value.list.return_value.execute.return_value = {
+            "items": [{"id": "888", "status": "SUCCESSFUL"}]
+        }
+        backup_id, owned = acquire_backup(svc, cfg)
+        assert backup_id == 888
+        assert owned is False
+        # Must NOT create a new backup when reusing.
+        svc.backupRuns.return_value.insert.assert_not_called()

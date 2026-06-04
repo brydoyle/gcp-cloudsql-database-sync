@@ -140,6 +140,16 @@ FIELDS = [
             if v and not re.match(r"^[^@]+@[^@]+\.[^@]+$", v) else None
         ),
     },
+    {
+        "key":      "use_latest_existing_backup",
+        "label":    "Reuse the most recent existing backup instead of creating one?",
+        "hint":     "true/false — when true, the reused backup is never deleted (default: false)",
+        "default":  "false",
+        "validate": lambda v: (
+            "Must be 'true' or 'false'"
+            if v.lower() not in ("true", "false") else None
+        ),
+    },
 ]
 
 
@@ -200,6 +210,8 @@ def _write_tfvars(path: str, config: dict) -> None:
     email_line = (f'alert_email = "{alert_email}"'
                   if alert_email else
                   '# alert_email = "your-team@example.com"')
+    # Terraform expects an unquoted bool literal.
+    use_latest = str(cfg.get("use_latest_existing_backup", "false")).lower() == "true"
 
     with open(path, "w") as f:
         f.write(f"""\
@@ -216,6 +228,8 @@ region     = "{cfg['region']}"
 job_name   = "{job_name}"
 schedule   = "{cfg['schedule']}"
 timezone   = "{cfg['timezone']}"
+
+use_latest_existing_backup = {"true" if use_latest else "false"}
 
 # Build image first: gcloud builds submit sync_job/ --tag={image}
 container_image = "{image}"

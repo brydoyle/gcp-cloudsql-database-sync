@@ -476,3 +476,54 @@ class TestAlertEmailValidator:
         """Empty string is valid — alert_email is optional."""
         f = field("alert_email")
         assert f["validate"]("") is None
+
+
+# ---------------------------------------------------------------------------
+# use_latest_existing_backup field + tfvars emission
+# ---------------------------------------------------------------------------
+
+class TestUseLatestExistingBackup:
+
+    @pytest.mark.parametrize("value", ["true", "false", "TRUE", "False"])
+    def test_validator_accepts_bools(self, value):
+        assert field("use_latest_existing_backup")["validate"](value) is None
+
+    @pytest.mark.parametrize("value", ["yes", "1", "maybe", "", "  "])
+    def test_validator_rejects_non_bools(self, value):
+        assert field("use_latest_existing_backup")["validate"](value) is not None
+
+    def _base_config(self, **overrides):
+        cfg = {
+            "prod_project_id": "my-prod",
+            "prod_instance_name": "prod-db",
+            "nonprod_project_id": "my-nonprod",
+            "nonprod_instance_name": "nonprod-db",
+            "region": "us-central1",
+            "job_name": "cloudsql-sync",
+            "schedule": "0 2 * * *",
+            "timezone": "UTC",
+        }
+        cfg.update(overrides)
+        return cfg
+
+    def test_tfvars_emits_true_unquoted(self):
+        cfg = self._base_config(use_latest_existing_backup="true")
+        with tempfile.NamedTemporaryFile(suffix=".tfvars", delete=False) as f:
+            path = f.name
+        try:
+            _write_tfvars(path, cfg)
+            content = open(path).read()
+            assert "use_latest_existing_backup = true" in content
+        finally:
+            os.unlink(path)
+
+    def test_tfvars_emits_false_unquoted_by_default(self):
+        cfg = self._base_config()  # field absent → defaults to false
+        with tempfile.NamedTemporaryFile(suffix=".tfvars", delete=False) as f:
+            path = f.name
+        try:
+            _write_tfvars(path, cfg)
+            content = open(path).read()
+            assert "use_latest_existing_backup = false" in content
+        finally:
+            os.unlink(path)
