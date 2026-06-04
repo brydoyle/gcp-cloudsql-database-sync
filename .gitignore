@@ -19,6 +19,9 @@ application_default_credentials.json
 .env
 .envrc
 
+# Local config with real project IDs — use config.yaml.example as the template
+sync_job/config.yaml
+
 # IDE
 .idea/
 .vscode/

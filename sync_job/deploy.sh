@@ -3,34 +3,68 @@
 # Run from the sync_job/ directory. Safe to re-run (idempotent).
 #
 # Prerequisites:
-#   gcloud CLI authenticated with sufficient IAM in both projects.
+#   - gcloud CLI authenticated with sufficient IAM in both projects
+#   - config.yaml present (run: python3 configure.py)
 #
 # Usage:
-#   Edit the variables below, then: bash deploy.sh
+#   python3 configure.py   # first-time setup
+#   bash deploy.sh         # deploy
 
 set -euo pipefail
 
-# ── Edit these ──────────────────────────────────────────────────────────────
-PROD_PROJECT="project-acc18188-41b4-403b-a21"
-PROD_INSTANCE="production-postgresql"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CONFIG_FILE="${SCRIPT_DIR}/config.yaml"
 
-NONPROD_PROJECT="nonproduction-498401"
-NONPROD_INSTANCE="nonproduction-postgresql"
+# ── Load config.yaml ─────────────────────────────────────────────────────────
+if [[ ! -f "${CONFIG_FILE}" ]]; then
+  echo "ERROR: config.yaml not found. Run 'python3 configure.py' first."
+  exit 1
+fi
 
-# Where to deploy the Cloud Run Job.
-RUN_REGION="us-central1"
-JOB_NAME="cloudsql-sync"
+log() { echo "[deploy] $*"; }
+
+read_config() {
+  python3 -c "
+import sys
+try:
+    import yaml
+    with open('${CONFIG_FILE}') as f:
+        cfg = yaml.safe_load(f)
+except ImportError:
+    cfg = {}
+    with open('${CONFIG_FILE}') as f:
+        for line in f:
+            line = line.strip()
+            if line and not line.startswith('#') and ':' in line:
+                k, _, v = line.partition(':')
+                cfg[k.strip()] = v.strip().strip('\"')
+key = sys.argv[1]
+val = cfg.get(key, '')
+if not val:
+    print(f'ERROR: {key} is not set in config.yaml', file=sys.stderr)
+    sys.exit(1)
+print(val)
+" "$1"
+}
+
+PROD_PROJECT=$(read_config prod_project_id)
+PROD_INSTANCE=$(read_config prod_instance_name)
+NONPROD_PROJECT=$(read_config nonprod_project_id)
+NONPROD_INSTANCE=$(read_config nonprod_instance_name)
+RUN_REGION=$(read_config region)
+SCHEDULE=$(read_config schedule)
+SCHEDULER_TIMEZONE=$(read_config timezone)
+JOB_NAME=$(read_config job_name)
+
 IMAGE="gcr.io/${NONPROD_PROJECT}/${JOB_NAME}"
-
-# Cloud Scheduler — nightly at 02:00 UTC by default.
-SCHEDULE="0 2 * * *"
-SCHEDULER_TIMEZONE="UTC"
-# ────────────────────────────────────────────────────────────────────────────
-
 JOB_SA="${JOB_NAME}@${NONPROD_PROJECT}.iam.gserviceaccount.com"
 SCHEDULER_SA="${JOB_NAME}-scheduler@${NONPROD_PROJECT}.iam.gserviceaccount.com"
 
-log() { echo "[deploy] $*"; }
+log "Loaded config:"
+log "  Prod:    ${PROD_PROJECT} / ${PROD_INSTANCE}"
+log "  Nonprod: ${NONPROD_PROJECT} / ${NONPROD_INSTANCE}"
+log "  Region:  ${RUN_REGION}"
+log "  Schedule: ${SCHEDULE} (${SCHEDULER_TIMEZONE})"
 
 # ── 1. Enable required APIs ──────────────────────────────────────────────────
 log "Enabling APIs..."
@@ -49,8 +83,6 @@ gcloud iam service-accounts create "${JOB_NAME}" \
   --display-name="CloudSQL Sync Job" \
   --project="${NONPROD_PROJECT}" 2>/dev/null || true
 
-# Wait for the service account to propagate before binding IAM policies.
-# GCP has an eventual-consistency delay after SA creation.
 log "Waiting for service account to propagate..."
 for i in $(seq 1 10); do
   if gcloud iam service-accounts describe "${JOB_SA}" --project="${NONPROD_PROJECT}" &>/dev/null; then
@@ -65,13 +97,11 @@ for i in $(seq 1 10); do
   sleep 3
 done
 
-# Create backups on prod.
 gcloud projects add-iam-policy-binding "${PROD_PROJECT}" \
   --member="serviceAccount:${JOB_SA}" \
   --role="roles/cloudsql.admin" \
   --condition=None
 
-# Read prod backups + trigger restore on nonprod.
 gcloud projects add-iam-policy-binding "${NONPROD_PROJECT}" \
   --member="serviceAccount:${JOB_SA}" \
   --role="roles/cloudsql.admin" \
@@ -145,7 +175,7 @@ gcloud scheduler jobs update http "${JOB_NAME}-nightly" \
   --project="${NONPROD_PROJECT}"
 
 log ""
-log "Done. Schedule: ${SCHEDULE} ${SCHEDULER_TIMEZONE}"
+log "Done. Schedule: ${SCHEDULE} (${SCHEDULER_TIMEZONE})"
 log ""
 log "Manual run:"
 log "  gcloud run jobs execute ${JOB_NAME} --region=${RUN_REGION} --project=${NONPROD_PROJECT}"
