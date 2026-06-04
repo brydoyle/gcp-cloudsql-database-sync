@@ -79,7 +79,8 @@ gcloud run jobs deploy "${JOB_NAME}" \
 PROD_PROJECT_ID=${PROD_PROJECT},\
 PROD_INSTANCE_NAME=${PROD_INSTANCE},\
 NONPROD_PROJECT_ID=${NONPROD_PROJECT},\
-NONPROD_INSTANCE_NAME=${NONPROD_INSTANCE}" \
+NONPROD_INSTANCE_NAME=${NONPROD_INSTANCE},\
+GCP_REGION=${RUN_REGION}" \
   --project="${NONPROD_PROJECT}"
 
 # ── 5. Cloud Scheduler ───────────────────────────────────────────────────────

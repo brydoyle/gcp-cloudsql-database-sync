@@ -20,7 +20,9 @@ from main import (
     SyncError,
     _extract_op_name,
     _raise_for_http_error,
-    _validate_resource_name,
+    _validate_instance_name,
+    _validate_project_id,
+    _validate_region,
     create_backup,
     delete_backup,
     load_config,
@@ -37,6 +39,7 @@ VALID_ENV = {
     "PROD_INSTANCE_NAME": "prod-db",
     "NONPROD_PROJECT_ID": "my-nonprod-project",
     "NONPROD_INSTANCE_NAME": "nonprod-db",
+    "GCP_REGION": "us-central1",
 }
 
 FAST_CFG = Config(
@@ -44,6 +47,7 @@ FAST_CFG = Config(
     prod_instance="prod-db",
     nonprod_project="my-nonprod-project",
     nonprod_instance="nonprod-db",
+    region="us-central1",
     poll_interval=0,
     operation_timeout=60,
 )
@@ -87,6 +91,26 @@ class TestLoadConfig:
         assert cfg.poll_interval == 30
         assert cfg.operation_timeout == 3600
 
+    def test_region_stored_in_config(self):
+        env = {**VALID_ENV, "GCP_REGION": "europe-west1"}
+        with patch.dict("os.environ", env, clear=True):
+            cfg = load_config()
+        assert cfg.region == "europe-west1"
+
+    def test_missing_region_rejected(self):
+        env = {k: v for k, v in VALID_ENV.items() if k != "GCP_REGION"}
+        with patch.dict("os.environ", env, clear=True):
+            with pytest.raises(SystemExit) as exc_info:
+                load_config()
+        assert exc_info.value.code == 1
+
+    def test_invalid_region_rejected(self):
+        env = {**VALID_ENV, "GCP_REGION": "not-a-real-region"}
+        with patch.dict("os.environ", env, clear=True):
+            with pytest.raises(SystemExit) as exc_info:
+                load_config()
+        assert exc_info.value.code == 1
+
     def test_missing_all_vars_reports_all_errors(self):
         """Should report every missing variable before exiting — not just the first."""
         with patch.dict("os.environ", {}, clear=True):
@@ -120,6 +144,7 @@ class TestLoadConfig:
             "PROD_INSTANCE_NAME": "prod-db",
             "NONPROD_PROJECT_ID": "same-project",
             "NONPROD_INSTANCE_NAME": "nonprod-db",
+            "GCP_REGION": "us-central1",
         }
         with patch.dict("os.environ", env, clear=True):
             cfg = load_config()
@@ -146,8 +171,22 @@ class TestLoadConfig:
                 load_config()
         assert exc_info.value.code == 1
 
+    def test_poll_interval_above_maximum_rejected(self):
+        env = {**VALID_ENV, "POLL_INTERVAL_SECONDS": "9999"}
+        with patch.dict("os.environ", env, clear=True):
+            with pytest.raises(SystemExit) as exc_info:
+                load_config()
+        assert exc_info.value.code == 1
+
     def test_timeout_below_minimum_rejected(self):
         env = {**VALID_ENV, "OPERATION_TIMEOUT_SECONDS": "10"}
+        with patch.dict("os.environ", env, clear=True):
+            with pytest.raises(SystemExit) as exc_info:
+                load_config()
+        assert exc_info.value.code == 1
+
+    def test_timeout_above_maximum_rejected(self):
+        env = {**VALID_ENV, "OPERATION_TIMEOUT_SECONDS": "999999"}
         with patch.dict("os.environ", env, clear=True):
             with pytest.raises(SystemExit) as exc_info:
                 load_config()
@@ -169,41 +208,121 @@ class TestLoadConfig:
 
 
 # ---------------------------------------------------------------------------
-# _validate_resource_name
+# _validate_project_id
 # ---------------------------------------------------------------------------
 
-class TestValidateResourceName:
+class TestValidateProjectId:
 
     @pytest.mark.parametrize("name", [
-        "a",
-        "my-project",
-        "prod-db-01",
-        "a" * 63,
-        "abc123",
+        "my-proj1",           # typical
+        "acme-prod",          # typical
+        "abcdef",             # 6 chars minimum
+        "a" + "b" * 28 + "c", # 30 chars maximum
+        "proj123",            # digits in middle
     ])
-    def test_valid_names(self, name):
+    def test_valid_project_ids(self, name):
         errors: list = []
-        _validate_resource_name(name, "LABEL", errors)
+        _validate_project_id(name, "LABEL", errors)
+        assert errors == [], f"Expected {name!r} to be valid"
+
+    @pytest.mark.parametrize("name", [
+        "ab",                  # too short (< 6 chars)
+        "abcde",               # 5 chars — still too short
+        "1starts-with-digit",  # must start with letter
+        "-starts-with-hyphen", # must start with letter
+        "ends-with-hyphen-",   # no trailing hyphen
+        "has_underscore",      # underscores not allowed
+        "has.dot",             # dots not allowed
+        "HAS_UPPER",           # uppercase not allowed
+        "has spaces",          # spaces not allowed
+        "has\nnewline",        # newlines not allowed (log injection)
+        "a" * 31,              # too long (> 30 chars)
+    ])
+    def test_invalid_project_ids(self, name):
+        errors: list = []
+        _validate_project_id(name, "LABEL", errors)
+        assert len(errors) == 1, f"Expected {name!r} to be invalid"
+
+    def test_empty_string_skipped(self):
+        errors: list = []
+        _validate_project_id("", "LABEL", errors)
         assert errors == []
 
+
+# ---------------------------------------------------------------------------
+# _validate_instance_name
+# ---------------------------------------------------------------------------
+
+class TestValidateInstanceName:
+
     @pytest.mark.parametrize("name", [
-        "UPPERCASE",
-        "has spaces",
-        "has_underscore",
-        "has.dot",
-        "-starts-with-hyphen",
-        "ends-with-hyphen-",
-        "has\nnewline",
+        "a",                    # 1 char minimum
+        "prod-db",              # typical
+        "nonprod-db-01",        # typical with numbers
+        "a" + "b" * 96 + "c",  # 98 chars maximum
     ])
-    def test_invalid_names(self, name):
+    def test_valid_instance_names(self, name):
         errors: list = []
-        _validate_resource_name(name, "LABEL", errors)
+        _validate_instance_name(name, "LABEL", errors)
+        assert errors == [], f"Expected {name!r} to be valid"
+
+    @pytest.mark.parametrize("name", [
+        "1starts-with-digit",   # must start with letter
+        "-starts-with-hyphen",  # must start with letter
+        "ends-with-hyphen-",    # no trailing hyphen
+        "has_underscore",       # underscores not allowed
+        "HAS_UPPER",            # uppercase not allowed
+        "has spaces",           # spaces not allowed
+        "has\nnewline",         # newlines not allowed
+        "a" * 99,               # too long (> 98 chars)
+    ])
+    def test_invalid_instance_names(self, name):
+        errors: list = []
+        _validate_instance_name(name, "LABEL", errors)
+        assert len(errors) == 1, f"Expected {name!r} to be invalid"
+
+    def test_empty_string_skipped(self):
+        errors: list = []
+        _validate_instance_name("", "LABEL", errors)
+        assert errors == []
+
+
+# ---------------------------------------------------------------------------
+# _validate_region
+# ---------------------------------------------------------------------------
+
+class TestValidateRegion:
+
+    @pytest.mark.parametrize("region", [
+        "us-central1",
+        "europe-west1",
+        "asia-east1",
+        "us-east4",
+        "australia-southeast1",
+        "me-west1",
+        "africa-south1",
+    ])
+    def test_valid_regions(self, region):
+        errors: list = []
+        _validate_region(region, "GCP_REGION", errors)
+        assert errors == []
+
+    @pytest.mark.parametrize("region", [
+        "us-central",           # missing zone number
+        "us-central-1",         # wrong separator format
+        "not-a-region",
+        "US-CENTRAL1",          # uppercase
+        "us central1",          # space
+        "us-central1; DROP",    # injection attempt
+    ])
+    def test_invalid_regions(self, region):
+        errors: list = []
+        _validate_region(region, "GCP_REGION", errors)
         assert len(errors) == 1
 
     def test_empty_string_skipped(self):
-        """Empty string is handled by _require_env; _validate_resource_name skips it."""
         errors: list = []
-        _validate_resource_name("", "LABEL", errors)
+        _validate_region("", "GCP_REGION", errors)
         assert errors == []
 
 

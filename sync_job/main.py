@@ -42,9 +42,38 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-# GCP resource name character set: lowercase letters, digits, hyphens.
-# No length cap — the API enforces limits; the regex blocks log-injection chars.
-_RESOURCE_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9\-]*[a-z0-9]$|^[a-z0-9]$")
+# GCP project IDs: 6–30 chars, must start with a lowercase letter,
+# lowercase letters/digits/hyphens only, no trailing hyphen.
+# https://cloud.google.com/resource-manager/docs/creating-managing-projects
+_PROJECT_ID_RE = re.compile(r"^[a-z][a-z0-9\-]{4,28}[a-z0-9]$")
+
+# Cloud SQL instance names: 1–98 chars, must start with a lowercase letter,
+# lowercase letters/digits/hyphens only, no trailing hyphen.
+# https://cloud.google.com/sql/docs/postgres/instance-settings
+_INSTANCE_NAME_RE = re.compile(r"^[a-z]([a-z0-9\-]{0,96}[a-z0-9])?$")
+
+# Valid GCP regions for Cloud SQL / Cloud Run.
+# https://cloud.google.com/about/locations
+_GCP_REGIONS: frozenset[str] = frozenset({
+    # Americas
+    "us-central1", "us-east1", "us-east4", "us-east5", "us-south1",
+    "us-west1", "us-west2", "us-west3", "us-west4",
+    "northamerica-northeast1", "northamerica-northeast2",
+    "southamerica-east1", "southamerica-west1",
+    # Europe
+    "europe-central2", "europe-north1", "europe-southwest1",
+    "europe-west1", "europe-west2", "europe-west3", "europe-west4",
+    "europe-west6", "europe-west8", "europe-west9", "europe-west10", "europe-west12",
+    # Asia Pacific
+    "asia-east1", "asia-east2",
+    "asia-northeast1", "asia-northeast2", "asia-northeast3",
+    "asia-south1", "asia-south2",
+    "asia-southeast1", "asia-southeast2",
+    "australia-southeast1", "australia-southeast2",
+    # Middle East & Africa
+    "me-central1", "me-central2", "me-west1",
+    "africa-south1",
+})
 
 
 # ---------------------------------------------------------------------------
@@ -78,6 +107,7 @@ class Config:
     prod_instance: str
     nonprod_project: str
     nonprod_instance: str
+    region: str
     poll_interval: int
     operation_timeout: int
 
@@ -90,7 +120,7 @@ def _require_env(name: str, errors: list) -> str:
 
 
 def _optional_int_env(
-    name: str, default_value: int, minimum: int, errors: list
+    name: str, default_value: int, minimum: int, maximum: int, errors: list
 ) -> int:
     raw = os.getenv(name, str(default_value))
     try:
@@ -100,19 +130,49 @@ def _optional_int_env(
             f"Environment variable {name} must be an integer, got: {raw!r}"
         )
         return default_value
-    if value < minimum:
+    if value < minimum or value > maximum:
         errors.append(
-            f"Environment variable {name} must be >= {minimum}, got {value}"
+            f"Environment variable {name} must be between {minimum} and {maximum}, got {value}"
         )
         return default_value
     return value
 
 
-def _validate_resource_name(name: str, label: str, errors: list) -> None:
-    if name and not _RESOURCE_NAME_RE.match(name):
+def _validate_project_id(value: str, label: str, errors: list) -> None:
+    """GCP project IDs: 6–30 chars, starts with a letter, letters/digits/hyphens,
+    no trailing hyphen."""
+    if not value:
+        return  # already caught by _require_env
+    if not _PROJECT_ID_RE.match(value):
         errors.append(
-            f"{label} {name!r} is not a valid GCP resource name "
-            "(lowercase letters, digits, hyphens)"
+            f"{label} {value!r} is not a valid GCP project ID "
+            "(6–30 chars, must start with a lowercase letter, "
+            "lowercase letters/digits/hyphens only, no trailing hyphen)"
+        )
+
+
+def _validate_instance_name(value: str, label: str, errors: list) -> None:
+    """Cloud SQL instance names: 1–98 chars, starts with a letter,
+    letters/digits/hyphens, no trailing hyphen."""
+    if not value:
+        return
+    if not _INSTANCE_NAME_RE.match(value):
+        errors.append(
+            f"{label} {value!r} is not a valid Cloud SQL instance name "
+            "(1–98 chars, must start with a lowercase letter, "
+            "lowercase letters/digits/hyphens only, no trailing hyphen)"
+        )
+
+
+def _validate_region(value: str, label: str, errors: list) -> None:
+    """Validate against the known set of GCP regions."""
+    if not value:
+        return
+    if value not in _GCP_REGIONS:
+        errors.append(
+            f"{label} {value!r} is not a recognised GCP region. "
+            f"Valid examples: us-central1, europe-west1, asia-east1. "
+            f"Full list: https://cloud.google.com/about/locations"
         )
 
 
@@ -121,17 +181,26 @@ def load_config() -> Config:
     misconfigured environment reports every problem in a single run."""
     errors: list[str] = []
 
-    prod_project  = _require_env("PROD_PROJECT_ID",   errors)
-    prod_instance = _require_env("PROD_INSTANCE_NAME", errors)
+    prod_project     = _require_env("PROD_PROJECT_ID",      errors)
+    prod_instance    = _require_env("PROD_INSTANCE_NAME",   errors)
     nonprod_project  = _require_env("NONPROD_PROJECT_ID",   errors)
     nonprod_instance = _require_env("NONPROD_INSTANCE_NAME", errors)
-    poll    = _optional_int_env("POLL_INTERVAL_SECONDS",    15,   minimum=1,  errors=errors)
-    timeout = _optional_int_env("OPERATION_TIMEOUT_SECONDS", 7200, minimum=60, errors=errors)
+    region           = _require_env("GCP_REGION",           errors)
 
-    _validate_resource_name(prod_project,     "PROD_PROJECT_ID",    errors)
-    _validate_resource_name(prod_instance,    "PROD_INSTANCE_NAME", errors)
-    _validate_resource_name(nonprod_project,  "NONPROD_PROJECT_ID",    errors)
-    _validate_resource_name(nonprod_instance, "NONPROD_INSTANCE_NAME", errors)
+    # POLL_INTERVAL_SECONDS: 1–3600s (1 second to 1 hour)
+    poll = _optional_int_env(
+        "POLL_INTERVAL_SECONDS", default_value=15, minimum=1, maximum=3600, errors=errors
+    )
+    # OPERATION_TIMEOUT_SECONDS: 60s–86400s (1 minute to 24 hours)
+    timeout = _optional_int_env(
+        "OPERATION_TIMEOUT_SECONDS", default_value=7200, minimum=60, maximum=86400, errors=errors
+    )
+
+    _validate_project_id(prod_project,     "PROD_PROJECT_ID",      errors)
+    _validate_project_id(nonprod_project,  "NONPROD_PROJECT_ID",   errors)
+    _validate_instance_name(prod_instance,    "PROD_INSTANCE_NAME",   errors)
+    _validate_instance_name(nonprod_instance, "NONPROD_INSTANCE_NAME", errors)
+    _validate_region(region, "GCP_REGION", errors)
 
     if errors:
         for err in errors:
@@ -152,6 +221,7 @@ def load_config() -> Config:
         prod_instance=prod_instance,
         nonprod_project=nonprod_project,
         nonprod_instance=nonprod_instance,
+        region=region,
         poll_interval=poll,
         operation_timeout=timeout,
     )
@@ -365,9 +435,10 @@ def delete_backup(service, backup_id: int, cfg: Config) -> None:
 def main() -> None:
     cfg = load_config()
     log.info(
-        "Starting sync: %s/%s → %s/%s",
+        "Starting sync: %s/%s → %s/%s  (region: %s)",
         cfg.prod_project, cfg.prod_instance,
         cfg.nonprod_project, cfg.nonprod_instance,
+        cfg.region,
     )
     log.info(
         "Config: poll_interval=%ds  timeout=%ds",
