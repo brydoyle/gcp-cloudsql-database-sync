@@ -261,7 +261,7 @@ def _extract_op_name(op: dict, context: str) -> str:
 
 
 _HTTP_HINTS: dict[int, str] = {
-    400: "instance tier or PostgreSQL version mismatch between prod and non-prod",
+    400: "bad request — possible causes: (1) GCP Free Trial instance — upgrade to a paid account; (2) instance tier or PostgreSQL version mismatch between prod and non-prod",
     403: "check that the job service account has the required cloudsql.* permissions",
     404: "instance or backup not found — verify instance names and backup ID",
     409: "a conflicting operation (backup, restore, or maintenance) is already in progress",
