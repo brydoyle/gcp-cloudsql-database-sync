@@ -1,0 +1,47 @@
+# ---------------------------------------------------------------------------
+# OPTIONAL EXAMPLE — trigger a one-time initial sync at `terraform apply`.
+#
+# Use this ONLY if you want a freshly-provisioned target populated as part of
+# the same apply that created it ("day-0" convenience). For most workflows,
+# prefer running the sync as a separate action after apply:
+#
+#     gcloud run jobs execute cloudsql-sync --region=us-central1 \
+#       --project=YOUR_CONTROL_PROJECT --wait
+#
+# ⚠️  KNOW THE TRADE-OFFS (see ADR-001 discussion / README "Triggering a sync"):
+#   - This is an ACTION, not state. Terraform cannot detect, converge, or
+#     drift-check "the data is synced" — it runs once on create and never again.
+#   - It couples `terraform apply` to a 7–30 min data operation that can fail
+#     for non-infra reasons (backup in progress, version mismatch, Free Trial).
+#   - It requires the `gcloud` CLI and credentials on the machine running
+#     Terraform — breaking the "provider credentials only" model.
+#   - HashiCorp documents provisioners as a last resort.
+#
+# To use: copy into this module, rename to `.tf`, `terraform apply`.
+# ---------------------------------------------------------------------------
+
+# Uses terraform_data (built into Terraform >= 1.4 — no `null` provider needed).
+resource "terraform_data" "initial_sync" {
+  # Re-run the sync whenever the job's image or target set changes.
+  # (Remove this to make it strictly create-once.)
+  triggers_replace = [
+    var.container_image,
+    local.nonprod_targets_env,
+  ]
+
+  provisioner "local-exec" {
+    command = <<-EOT
+      gcloud run jobs execute ${var.job_name} \
+        --region=${var.region} \
+        --project=${var.nonprod_project_id} \
+        --wait
+    EOT
+  }
+
+  # Only run after the job and its IAM bindings exist.
+  depends_on = [
+    google_cloud_run_v2_job.sync,
+    google_project_iam_member.job_prod_cloudsql_admin,
+    google_project_iam_member.job_target_cloudsql_admin,
+  ]
+}
