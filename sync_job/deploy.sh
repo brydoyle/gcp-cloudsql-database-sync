@@ -174,6 +174,71 @@ gcloud scheduler jobs update http "${JOB_NAME}-nightly" \
   --oauth-service-account-email="${SCHEDULER_SA}" \
   --project="${NONPROD_PROJECT}"
 
+# ── 6. Monitoring & Alerting ──────────────────────────────────────────────────
+ALERT_EMAIL=$(read_config alert_email 2>/dev/null || true)
+
+if [[ -n "${ALERT_EMAIL}" ]]; then
+  log "Enabling monitoring APIs..."
+  gcloud services enable monitoring.googleapis.com logging.googleapis.com \
+    --project="${NONPROD_PROJECT}"
+
+  METRIC_NAME="${JOB_NAME}-failure"
+
+  log "Creating log-based failure metric..."
+  gcloud logging metrics create "${METRIC_NAME}" \
+    --description="Failed executions of the ${JOB_NAME} Cloud Run Job" \
+    --log-filter="resource.type=\"cloud_run_job\" AND resource.labels.job_name=\"${JOB_NAME}\" AND textPayload=~\"Container called exit\([1-9][0-9]*\)\"" \
+    --project="${NONPROD_PROJECT}" 2>/dev/null || \
+  gcloud logging metrics update "${METRIC_NAME}" \
+    --description="Failed executions of the ${JOB_NAME} Cloud Run Job" \
+    --log-filter="resource.type=\"cloud_run_job\" AND resource.labels.job_name=\"${JOB_NAME}\" AND textPayload=~\"Container called exit\([1-9][0-9]*\)\"" \
+    --project="${NONPROD_PROJECT}"
+
+  log "Creating email notification channel for ${ALERT_EMAIL}..."
+  CHANNEL_NAME=$(gcloud monitoring channels list \
+    --filter="type=email AND labels.email_address=${ALERT_EMAIL}" \
+    --format="value(name)" \
+    --project="${NONPROD_PROJECT}" | head -1)
+
+  if [[ -z "${CHANNEL_NAME}" ]]; then
+    CHANNEL_NAME=$(gcloud monitoring channels create \
+      --display-name="CloudSQL Sync Alerts" \
+      --type=email \
+      --channel-labels="email_address=${ALERT_EMAIL}" \
+      --format="value(name)" \
+      --project="${NONPROD_PROJECT}")
+    log "Created notification channel: ${CHANNEL_NAME}"
+  else
+    log "Reusing existing notification channel: ${CHANNEL_NAME}"
+  fi
+
+  log "Creating alert policy..."
+  POLICY_EXISTS=$(gcloud alpha monitoring policies list \
+    --filter="displayName='${JOB_NAME} sync failed'" \
+    --format="value(name)" \
+    --project="${NONPROD_PROJECT}" 2>/dev/null | head -1)
+
+  if [[ -z "${POLICY_EXISTS}" ]]; then
+    gcloud alpha monitoring policies create \
+      --display-name="${JOB_NAME} sync failed" \
+      --condition-display-name="Sync job exited with non-zero code" \
+      --condition-filter="metric.type=\"logging.googleapis.com/user/${METRIC_NAME}\" AND resource.type=\"cloud_run_job\"" \
+      --condition-threshold-value=0 \
+      --condition-threshold-comparison=COMPARISON_GT \
+      --condition-aggregations="alignmentPeriod=60s,perSeriesAligner=ALIGN_COUNT" \
+      --duration=0s \
+      --notification-channels="${CHANNEL_NAME}" \
+      --documentation="The ${JOB_NAME} sync job failed. Check logs at https://console.cloud.google.com/run/jobs?project=${NONPROD_PROJECT}" \
+      --project="${NONPROD_PROJECT}"
+    log "Alert policy created — emails will be sent to ${ALERT_EMAIL} on failure."
+  else
+    log "Alert policy already exists: ${POLICY_EXISTS}"
+  fi
+else
+  log "No alert_email set in config.yaml — skipping monitoring setup."
+  log "  Add 'alert_email: you@example.com' to config.yaml and re-run to enable alerts."
+fi
+
 log ""
 log "Done. Schedule: ${SCHEDULE} (${SCHEDULER_TIMEZONE})"
 log ""
