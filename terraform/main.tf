@@ -21,6 +21,17 @@ locals {
     "monitoring.googleapis.com",
     "logging.googleapis.com",
   ]
+
+  # Restore targets: the explicit list if provided, else the single pair.
+  targets = length(var.nonprod_targets) > 0 ? var.nonprod_targets : [
+    { project = var.nonprod_project_id, instance = var.nonprod_instance_name }
+  ]
+
+  # Distinct target projects that need the job SA's cloudsql.admin binding.
+  target_projects = distinct([for t in local.targets : t.project])
+
+  # Comma-separated "project:instance" string consumed by main.py.
+  nonprod_targets_env = join(",", [for t in local.targets : "${t.project}:${t.instance}"])
 }
 
 # ── APIs ─────────────────────────────────────────────────────────────────────
@@ -59,11 +70,13 @@ resource "google_project_iam_member" "job_prod_cloudsql_admin" {
   member   = "serviceAccount:${google_service_account.job.email}"
 }
 
-# Grant cloudsql.admin on the NONPROD project so the job can trigger restores.
-resource "google_project_iam_member" "job_nonprod_cloudsql_admin" {
-  project = var.nonprod_project_id
-  role    = "roles/cloudsql.admin"
-  member  = "serviceAccount:${google_service_account.job.email}"
+# Grant cloudsql.admin on each distinct target project so the job can trigger
+# restores there. With a single target this is just the control project.
+resource "google_project_iam_member" "job_target_cloudsql_admin" {
+  for_each = toset(local.target_projects)
+  project  = each.value
+  role     = "roles/cloudsql.admin"
+  member   = "serviceAccount:${google_service_account.job.email}"
 }
 
 # ── Scheduler service account ─────────────────────────────────────────────────
@@ -107,13 +120,11 @@ resource "google_cloud_run_v2_job" "sync" {
           name  = "PROD_INSTANCE_NAME"
           value = var.prod_instance_name
         }
+        # Multi-target fan-out: "project:instance,project:instance,..."
+        # main.py prefers this over the single NONPROD_PROJECT_ID pair.
         env {
-          name  = "NONPROD_PROJECT_ID"
-          value = var.nonprod_project_id
-        }
-        env {
-          name  = "NONPROD_INSTANCE_NAME"
-          value = var.nonprod_instance_name
+          name  = "NONPROD_TARGETS"
+          value = local.nonprod_targets_env
         }
         env {
           name  = "GCP_REGION"
@@ -141,7 +152,7 @@ resource "google_cloud_run_v2_job" "sync" {
   depends_on = [
     google_project_service.nonprod_apis,
     google_project_iam_member.job_prod_cloudsql_admin,
-    google_project_iam_member.job_nonprod_cloudsql_admin,
+    google_project_iam_member.job_target_cloudsql_admin,
   ]
 }
 
@@ -329,6 +340,6 @@ resource "google_secret_manager_secret_iam_member" "job_secret_accessor" {
   member    = "serviceAccount:${google_service_account.job.email}"
 }
 
-# Note: the job SA's existing roles/cloudsql.admin on the nonprod project
-# (job_nonprod_cloudsql_admin above) already includes cloudsql.users.update,
-# which is what reset_nonprod_password needs — no extra binding required.
+# Note: the job SA's per-target roles/cloudsql.admin bindings
+# (job_target_cloudsql_admin above) already include cloudsql.users.update,
+# which is what reset_target_password needs — no extra binding required.

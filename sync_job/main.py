@@ -104,11 +104,20 @@ class OperationTimeout(SyncError):
 # ---------------------------------------------------------------------------
 
 @dataclasses.dataclass(frozen=True)
+class Target:
+    """A single non-production restore target."""
+    project: str
+    instance: str
+
+    def __str__(self) -> str:
+        return f"{self.project}/{self.instance}"
+
+
+@dataclasses.dataclass(frozen=True)
 class Config:
     prod_project: str
     prod_instance: str
-    nonprod_project: str
-    nonprod_instance: str
+    nonprod_targets: tuple  # tuple[Target, ...]
     region: str
     poll_interval: int
     operation_timeout: int
@@ -178,16 +187,68 @@ def _validate_region(value: str, label: str, errors: list) -> None:
         )
 
 
+def _parse_targets(errors: list) -> tuple:
+    """Build the list of non-production restore targets.
+
+    Two input forms, in precedence order:
+      1. NONPROD_TARGETS — comma-separated "project:instance" pairs, e.g.
+         "dev-proj:dev-db,qa-proj:qa-db". Enables multi-target fan-out.
+      2. NONPROD_PROJECT_ID + NONPROD_INSTANCE_NAME — the single-target form
+         (backward compatible).
+
+    Each target's project and instance are validated. Returns a tuple of
+    Target. On any error, appends to `errors` and returns whatever parsed.
+    """
+    raw_targets = os.environ.get("NONPROD_TARGETS", "").strip()
+
+    targets: list = []
+    if raw_targets:
+        for i, entry in enumerate(raw_targets.split(",")):
+            entry = entry.strip()
+            if not entry:
+                continue
+            if entry.count(":") != 1:
+                errors.append(
+                    f"NONPROD_TARGETS entry #{i + 1} {entry!r} must be "
+                    "'project:instance'"
+                )
+                continue
+            project, instance = (p.strip() for p in entry.split(":"))
+            _validate_project_id(project, f"NONPROD_TARGETS[{i + 1}] project", errors)
+            _validate_instance_name(instance, f"NONPROD_TARGETS[{i + 1}] instance", errors)
+            targets.append(Target(project=project, instance=instance))
+        if not targets:
+            errors.append("NONPROD_TARGETS is set but contains no valid targets")
+    else:
+        # Single-target fallback.
+        project  = _require_env("NONPROD_PROJECT_ID",   errors)
+        instance = _require_env("NONPROD_INSTANCE_NAME", errors)
+        _validate_project_id(project, "NONPROD_PROJECT_ID", errors)
+        _validate_instance_name(instance, "NONPROD_INSTANCE_NAME", errors)
+        if project and instance:
+            targets.append(Target(project=project, instance=instance))
+
+    # Guard against the same target appearing twice — a duplicate restore
+    # is wasteful and almost always a config mistake.
+    seen = set()
+    for t in targets:
+        if t in seen:
+            errors.append(f"Duplicate restore target: {t}")
+        seen.add(t)
+
+    return tuple(targets)
+
+
 def load_config() -> Config:
     """Validate and return config. Collects ALL errors before exiting so a
     misconfigured environment reports every problem in a single run."""
     errors: list[str] = []
 
-    prod_project     = _require_env("PROD_PROJECT_ID",      errors)
-    prod_instance    = _require_env("PROD_INSTANCE_NAME",   errors)
-    nonprod_project  = _require_env("NONPROD_PROJECT_ID",   errors)
-    nonprod_instance = _require_env("NONPROD_INSTANCE_NAME", errors)
-    region           = _require_env("GCP_REGION",           errors)
+    prod_project  = _require_env("PROD_PROJECT_ID",    errors)
+    prod_instance = _require_env("PROD_INSTANCE_NAME", errors)
+    region        = _require_env("GCP_REGION",         errors)
+
+    nonprod_targets = _parse_targets(errors)
 
     # POLL_INTERVAL_SECONDS: 1–3600s (1 second to 1 hour)
     poll = _optional_int_env(
@@ -198,31 +259,27 @@ def load_config() -> Config:
         "OPERATION_TIMEOUT_SECONDS", default_value=7200, minimum=60, maximum=86400, errors=errors
     )
 
-    _validate_project_id(prod_project,     "PROD_PROJECT_ID",      errors)
-    _validate_project_id(nonprod_project,  "NONPROD_PROJECT_ID",   errors)
-    _validate_instance_name(prod_instance,    "PROD_INSTANCE_NAME",   errors)
-    _validate_instance_name(nonprod_instance, "NONPROD_INSTANCE_NAME", errors)
+    _validate_project_id(prod_project, "PROD_PROJECT_ID", errors)
+    _validate_instance_name(prod_instance, "PROD_INSTANCE_NAME", errors)
     _validate_region(region, "GCP_REGION", errors)
+
+    # Safety guard: prevent restoring prod onto itself (checked per target).
+    for t in nonprod_targets:
+        if t.project == prod_project and t.instance == prod_instance:
+            errors.append(
+                f"Target {t} is the same as PROD — refusing to continue to "
+                "avoid overwriting production data."
+            )
 
     if errors:
         for err in errors:
             log.error(err)
         sys.exit(1)
 
-    # Safety guard: prevent restoring prod onto itself.
-    if prod_project == nonprod_project and prod_instance == nonprod_instance:
-        log.error(
-            "PROD and NONPROD point to the same instance (%s/%s). "
-            "Refusing to continue to avoid overwriting production data.",
-            prod_project, prod_instance,
-        )
-        sys.exit(1)
-
     return Config(
         prod_project=prod_project,
         prod_instance=prod_instance,
-        nonprod_project=nonprod_project,
-        nonprod_instance=nonprod_instance,
+        nonprod_targets=nonprod_targets,
         region=region,
         poll_interval=poll,
         operation_timeout=timeout,
@@ -357,12 +414,9 @@ def create_backup(service, cfg: Config) -> int:
     return backup_id
 
 
-def restore_to_nonprod(service, backup_id: int, cfg: Config) -> None:
-    """Restore the prod backup to the non-prod instance (cross-project)."""
-    log.info(
-        "Restoring backup %d → %s/%s ...",
-        backup_id, cfg.nonprod_project, cfg.nonprod_instance,
-    )
+def restore_to_target(service, backup_id: int, target: Target, cfg: Config) -> None:
+    """Restore the prod backup to one non-prod target (cross-project)."""
+    log.info("Restoring backup %d → %s ...", backup_id, target)
     body = {
         "restoreBackupContext": {
             "kind": "sql#restoreBackupContext",
@@ -375,22 +429,19 @@ def restore_to_nonprod(service, backup_id: int, cfg: Config) -> None:
         op = (
             service.instances()
             .restoreBackup(
-                project=cfg.nonprod_project,
-                instance=cfg.nonprod_instance,
+                project=target.project,
+                instance=target.instance,
                 body=body,
             )
             .execute(num_retries=5)
         )
     except HttpError as exc:
-        _raise_for_http_error(
-            exc,
-            f"starting restore on {cfg.nonprod_project}/{cfg.nonprod_instance}",
-        )
+        _raise_for_http_error(exc, f"starting restore on {target}")
 
     op_name = _extract_op_name(op, "instances.restoreBackup")
     log.info("Restore operation started: %s", op_name)
-    wait_for_operation(service, cfg.nonprod_project, op_name, cfg)
-    log.info("Restore complete.")
+    wait_for_operation(service, target.project, op_name, cfg)
+    log.info("Restore to %s complete.", target)
 
 
 def delete_backup(service, backup_id: int, cfg: Config) -> None:
@@ -448,47 +499,34 @@ def _fetch_secret(secret_resource_name: str) -> str:
     return response.payload.data.decode("utf-8")
 
 
-def reset_nonprod_password(service, cfg: Config, secret_resource_name: str) -> None:
-    """Reset the nonprod postgres user password to the value in Secret Manager.
+def reset_target_password(service, target: Target, cfg: Config, password: str) -> None:
+    """Reset one target's postgres user password to the supplied value.
 
-    After a restore the nonprod instance has prod's password. This step
-    resets it to a known, separately-managed credential so nonprod apps
-    continue to work without reconfiguration.
+    After a restore the target instance has prod's password. This step resets
+    it to a known, separately-managed credential so the nonprod apps continue
+    to work without reconfiguration.
 
     Uses the Cloud SQL Admin API (no direct DB connection required).
     """
-    log.info(
-        "Resetting nonprod postgres password from Secret Manager secret: %s",
-        secret_resource_name,
-    )
-    try:
-        password = _fetch_secret(secret_resource_name)
-    except Exception as exc:  # noqa: BLE001
-        raise SyncError(
-            f"Failed to read secret {secret_resource_name}: {exc}"
-        ) from exc
-
+    log.info("Resetting postgres password on %s ...", target)
     try:
         op = (
             service.users()
             .update(
-                project=cfg.nonprod_project,
-                instance=cfg.nonprod_instance,
+                project=target.project,
+                instance=target.instance,
                 name="postgres",
                 body={"name": "postgres", "password": password},
             )
             .execute(num_retries=3)
         )
     except HttpError as exc:
-        _raise_for_http_error(
-            exc,
-            f"resetting postgres password on {cfg.nonprod_project}/{cfg.nonprod_instance}",
-        )
+        _raise_for_http_error(exc, f"resetting postgres password on {target}")
 
     # users.update returns an Operation — poll until done.
     op_name = _extract_op_name(op, "users.update")
-    wait_for_operation(service, cfg.nonprod_project, op_name, cfg)
-    log.info("Nonprod postgres password reset successfully.")
+    wait_for_operation(service, target.project, op_name, cfg)
+    log.info("Password reset on %s complete.", target)
 
 
 # ---------------------------------------------------------------------------
@@ -497,15 +535,16 @@ def reset_nonprod_password(service, cfg: Config, secret_resource_name: str) -> N
 
 def main() -> None:
     cfg = load_config()
-    # Optional: reset nonprod DB password after restore using Secret Manager.
+    # Optional: reset each target's DB password after restore using Secret Manager.
     # Set NONPROD_DB_PASSWORD_SECRET to the full secret resource name:
     #   projects/PROJECT/secrets/SECRET_NAME
     password_secret = os.getenv("NONPROD_DB_PASSWORD_SECRET", "").strip()
 
+    targets = cfg.nonprod_targets
     log.info(
-        "Starting sync: %s/%s → %s/%s  (region: %s)",
+        "Starting sync: %s/%s → %d target(s): %s  (region: %s)",
         cfg.prod_project, cfg.prod_instance,
-        cfg.nonprod_project, cfg.nonprod_instance,
+        len(targets), ", ".join(str(t) for t in targets),
         cfg.region,
     )
     log.info(
@@ -515,19 +554,41 @@ def main() -> None:
     )
 
     service = build_sqladmin()
+
+    # Fetch the password once and reuse for every target (it's the same secret).
+    password = None
+    if password_secret:
+        try:
+            password = _fetch_secret(password_secret)
+        except Exception as exc:  # noqa: BLE001
+            raise SyncError(
+                f"Failed to read secret {password_secret}: {exc}"
+            ) from exc
+
     backup_id = create_backup(service, cfg)
 
+    # Restore (and optionally reset password) for each target. A failure on
+    # one target is logged and recorded but does not block the others — we
+    # attempt all targets, then fail at the end if any failed.
+    failures: list = []
     try:
-        restore_to_nonprod(service, backup_id, cfg)
+        for target in targets:
+            try:
+                restore_to_target(service, backup_id, target, cfg)
+                if password is not None:
+                    reset_target_password(service, target, cfg, password)
+            except SyncError as exc:
+                log.error("Target %s failed: %s", target, exc)
+                failures.append((target, exc))
     finally:
         # Always attempt cleanup so backups don't accumulate even on failure.
         delete_backup(service, backup_id, cfg)
 
-    # Reset nonprod password after successful restore — runs outside the
-    # finally block so a password reset failure is fatal (exit 2) rather
-    # than silently swallowed.
-    if password_secret:
-        reset_nonprod_password(service, cfg, password_secret)
+    if failures:
+        names = ", ".join(str(t) for t, _ in failures)
+        raise SyncError(
+            f"{len(failures)} of {len(targets)} target(s) failed: {names}"
+        )
 
     log.info("Sync finished successfully.")
 
