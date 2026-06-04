@@ -14,9 +14,6 @@
 # ---------------------------------------------------------------------------
 
 locals {
-  job_sa_email       = "${var.job_name}@${var.nonprod_project_id}.iam.gserviceaccount.com"
-  scheduler_sa_email = "${var.job_name}-scheduler@${var.nonprod_project_id}.iam.gserviceaccount.com"
-
   apis = [
     "run.googleapis.com",
     "cloudscheduler.googleapis.com",
@@ -97,7 +94,7 @@ resource "google_cloud_run_v2_job" "sync" {
       service_account = google_service_account.job.email
       max_retries     = 1
 
-      timeout = "${var.task_timeout_seconds}s"
+      timeout = "${tostring(var.task_timeout_seconds)}s"
 
       containers {
         image = var.container_image

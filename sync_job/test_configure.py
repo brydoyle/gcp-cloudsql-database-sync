@@ -17,6 +17,7 @@ from configure import (
     _load_yaml,
     _prompt,
     _write_yaml,
+    _write_tfvars,
     FIELDS,
     GCP_REGIONS,
     _PROJECT_ID_RE,
@@ -323,3 +324,155 @@ class TestPrompt:
         with patch("builtins.input", side_effect=KeyboardInterrupt):
             with pytest.raises(SystemExit):
                 _prompt(f, None, non_interactive=False)
+
+    def test_optional_field_returns_empty_on_blank_input(self):
+        """alert_email is optional — blank input should return '' not loop."""
+        f = field("alert_email")
+        with patch("builtins.input", return_value=""):
+            result = _prompt(f, None, non_interactive=False)
+        assert result == ""
+
+    def test_optional_field_accepts_valid_email(self):
+        f = field("alert_email")
+        with patch("builtins.input", return_value="ops@example.com"):
+            result = _prompt(f, None, non_interactive=False)
+        assert result == "ops@example.com"
+
+    def test_optional_field_rejects_invalid_email(self):
+        """Invalid email should prompt again; second input is blank (skip)."""
+        f = field("alert_email")
+        with patch("builtins.input", side_effect=["not-an-email", ""]):
+            result = _prompt(f, None, non_interactive=False)
+        assert result == ""
+
+    def test_non_interactive_optional_field_returns_empty_when_missing(self):
+        """Optional field should return '' in non-interactive mode when not set."""
+        f = field("alert_email")
+        result = _prompt(f, None, non_interactive=True)
+        assert result == ""
+
+    def test_non_interactive_optional_field_validates_when_set(self):
+        """Even optional fields must pass validation when a value is present."""
+        f = field("alert_email")
+        with pytest.raises(SystemExit) as exc_info:
+            _prompt(f, "not-an-email", non_interactive=True)
+        assert exc_info.value.code == 1
+
+
+# ---------------------------------------------------------------------------
+# _write_tfvars
+# ---------------------------------------------------------------------------
+
+class TestWriteTfvars:
+
+    def _read(self, path: str) -> str:
+        with open(path) as f:
+            return f.read()
+
+    def test_writes_all_required_fields(self):
+        config = {
+            "prod_project_id": "my-prod",
+            "prod_instance_name": "prod-db",
+            "nonprod_project_id": "my-nonprod",
+            "nonprod_instance_name": "nonprod-db",
+            "region": "us-central1",
+            "job_name": "cloudsql-sync",
+            "schedule": "0 2 * * *",
+            "timezone": "UTC",
+        }
+        with tempfile.NamedTemporaryFile(suffix=".tfvars", delete=False) as f:
+            path = f.name
+        try:
+            _write_tfvars(path, config)
+            content = self._read(path)
+            assert 'prod_project_id       = "my-prod"' in content
+            assert 'nonprod_project_id    = "my-nonprod"' in content
+            assert 'region     = "us-central1"' in content
+            assert 'container_image = "gcr.io/my-nonprod/cloudsql-sync:latest"' in content
+        finally:
+            os.unlink(path)
+
+    def test_writes_alert_email_when_set(self):
+        config = {
+            "prod_project_id": "my-prod",
+            "prod_instance_name": "prod-db",
+            "nonprod_project_id": "my-nonprod",
+            "nonprod_instance_name": "nonprod-db",
+            "region": "us-central1",
+            "job_name": "cloudsql-sync",
+            "schedule": "0 2 * * *",
+            "timezone": "UTC",
+            "alert_email": "ops@example.com",
+        }
+        with tempfile.NamedTemporaryFile(suffix=".tfvars", delete=False) as f:
+            path = f.name
+        try:
+            _write_tfvars(path, config)
+            content = self._read(path)
+            assert 'alert_email = "ops@example.com"' in content
+        finally:
+            os.unlink(path)
+
+    def test_comments_out_alert_email_when_missing(self):
+        config = {
+            "prod_project_id": "my-prod",
+            "prod_instance_name": "prod-db",
+            "nonprod_project_id": "my-nonprod",
+            "nonprod_instance_name": "nonprod-db",
+            "region": "us-central1",
+            "job_name": "cloudsql-sync",
+            "schedule": "0 2 * * *",
+            "timezone": "UTC",
+            "alert_email": "",
+        }
+        with tempfile.NamedTemporaryFile(suffix=".tfvars", delete=False) as f:
+            path = f.name
+        try:
+            _write_tfvars(path, config)
+            content = self._read(path)
+            assert '# alert_email' in content
+            assert 'alert_email = ""' not in content
+        finally:
+            os.unlink(path)
+
+    def test_image_uri_uses_job_name(self):
+        config = {
+            "prod_project_id": "my-prod",
+            "prod_instance_name": "prod-db",
+            "nonprod_project_id": "my-nonprod",
+            "nonprod_instance_name": "nonprod-db",
+            "region": "us-central1",
+            "job_name": "my-custom-job",
+            "schedule": "0 2 * * *",
+            "timezone": "UTC",
+        }
+        with tempfile.NamedTemporaryFile(suffix=".tfvars", delete=False) as f:
+            path = f.name
+        try:
+            _write_tfvars(path, config)
+            content = self._read(path)
+            assert "my-custom-job" in content
+        finally:
+            os.unlink(path)
+
+
+# ---------------------------------------------------------------------------
+# alert_email field validator
+# ---------------------------------------------------------------------------
+
+class TestAlertEmailValidator:
+
+    def test_valid_emails(self):
+        f = field("alert_email")
+        for email in ["user@example.com", "ops+alerts@company.co.uk", "a@b.c"]:
+            assert f["validate"](email) is None, f"Expected {email!r} to be valid"
+
+    def test_invalid_emails(self):
+        f = field("alert_email")
+        for email in ["notanemail", "@nodomain", "no-at-sign"]:
+            assert f["validate"](email) is not None, f"Expected {email!r} to be invalid"
+
+    def test_empty_string_passes(self):
+        """Empty string is valid — alert_email is optional."""
+        f = field("alert_email")
+        assert f["validate"]("") is None
