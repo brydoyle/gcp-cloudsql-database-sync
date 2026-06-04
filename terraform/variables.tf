@@ -107,3 +107,9 @@ variable "poll_interval_seconds" {
     error_message = "poll_interval_seconds must be between 1 and 3600."
   }
 }
+
+variable "use_latest_existing_backup" {
+  description = "If true, reuse the most recent existing backup of the prod instance instead of creating a new one. A reused backup is never deleted by the job. Default false (create a fresh backup each run)."
+  type        = bool
+  default     = false
+}

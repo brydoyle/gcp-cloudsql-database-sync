@@ -48,8 +48,8 @@ if missing:
         print(f'ERROR: {k} is not set in config.yaml', file=sys.stderr)
     sys.exit(1)
 
-# Output required keys then optional alert_email (may be empty)
-for k in required + ['alert_email']:
+# Output required keys, then optional keys (may be empty)
+for k in required + ['alert_email', 'use_latest_existing_backup']:
     print(cfg.get(k, ''))
 ") || { log "ERROR: Failed to load config.yaml — run 'python3 configure.py' first."; exit 1; }
 
@@ -63,6 +63,9 @@ SCHEDULE=$(        sed -n '6p' <<< "${_raw_config}")
 SCHEDULER_TIMEZONE=$(sed -n '7p' <<< "${_raw_config}")
 JOB_NAME=$(        sed -n '8p' <<< "${_raw_config}")
 ALERT_EMAIL=$(     sed -n '9p' <<< "${_raw_config}")
+USE_LATEST_BACKUP=$(sed -n '10p' <<< "${_raw_config}")
+# Default to false when unset/blank
+USE_LATEST_BACKUP="${USE_LATEST_BACKUP:-false}"
 
 IMAGE="gcr.io/${NONPROD_PROJECT}/${JOB_NAME}"
 JOB_SA="${JOB_NAME}@${NONPROD_PROJECT}.iam.gserviceaccount.com"
@@ -73,6 +76,7 @@ log "  Prod:    ${PROD_PROJECT} / ${PROD_INSTANCE}"
 log "  Nonprod: ${NONPROD_PROJECT} / ${NONPROD_INSTANCE}"
 log "  Region:  ${RUN_REGION}"
 log "  Schedule: ${SCHEDULE} (${SCHEDULER_TIMEZONE})"
+log "  Backup:  $([ "${USE_LATEST_BACKUP}" = "true" ] && echo 'reuse latest existing' || echo 'create new')"
 
 # ── 1. Enable required APIs ──────────────────────────────────────────────────
 log "Enabling APIs..."
@@ -135,7 +139,8 @@ PROD_PROJECT_ID=${PROD_PROJECT},\
 PROD_INSTANCE_NAME=${PROD_INSTANCE},\
 NONPROD_PROJECT_ID=${NONPROD_PROJECT},\
 NONPROD_INSTANCE_NAME=${NONPROD_INSTANCE},\
-GCP_REGION=${RUN_REGION}" \
+GCP_REGION=${RUN_REGION},\
+USE_LATEST_EXISTING_BACKUP=${USE_LATEST_BACKUP}" \
   --project="${NONPROD_PROJECT}"
 
 # ── 5. Cloud Scheduler ───────────────────────────────────────────────────────

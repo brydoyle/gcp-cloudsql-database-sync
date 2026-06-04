@@ -17,3 +17,8 @@ timezone: UTC
 
 # Cloud Run Job name — change only if you need multiple sync jobs
 job_name: cloudsql-sync
+
+# Reuse the most recent EXISTING backup of the prod instance instead of
+# creating a new one each run. When true, the reused backup is never deleted
+# by the job. Default false (create a fresh on-demand backup every run).
+use_latest_existing_backup: "false"

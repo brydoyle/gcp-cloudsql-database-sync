@@ -4,12 +4,14 @@ instance in a different GCP project using native Cloud SQL backup snapshots.
 
 Flow:
   1. Validate config (including prod ≠ nonprod guard)
-  2. Create an on-demand backup of the prod instance
-  3. Wait for the backup to finish
-  4. Restore that backup to the non-prod instance (cross-project)
-  5. Wait for the restore to finish
-  6. Delete the on-demand backup to avoid quota accumulation
-  7. (Optional) Reset the nonprod postgres password from Secret Manager
+  2. Acquire a backup of the prod instance — either create a fresh on-demand
+     backup, or (USE_LATEST_EXISTING_BACKUP) reuse the newest existing one
+  3. Wait for the backup to finish (only when creating)
+  4. Restore that backup to each non-prod target (cross-project)
+  5. Wait for each restore to finish
+  6. Delete the backup to avoid quota accumulation — ONLY if this job
+     created it; a reused pre-existing backup is left in place
+  7. (Optional) Reset each target's postgres password from Secret Manager
 
 No GCS bucket or dump files involved — entirely managed by Cloud SQL.
 
@@ -121,6 +123,7 @@ class Config:
     region: str
     poll_interval: int
     operation_timeout: int
+    use_latest_existing_backup: bool = False
 
 
 def _require_env(name: str, errors: list) -> str:
@@ -128,6 +131,14 @@ def _require_env(name: str, errors: list) -> str:
     if not value:
         errors.append(f"Missing required environment variable: {name}")
     return value
+
+
+def _bool_env(name: str, default: bool = False) -> bool:
+    """Parse a boolean env var leniently. Accepts 1/true/yes/on (any case)."""
+    raw = os.getenv(name, "").strip().lower()
+    if raw == "":
+        return default
+    return raw in ("1", "true", "yes", "on")
 
 
 def _optional_int_env(
@@ -283,6 +294,7 @@ def load_config() -> Config:
         region=region,
         poll_interval=poll,
         operation_timeout=timeout,
+        use_latest_existing_backup=_bool_env("USE_LATEST_EXISTING_BACKUP", default=False),
     )
 
 
@@ -412,6 +424,63 @@ def create_backup(service, cfg: Config) -> int:
 
     log.info("Backup complete. Run ID: %d", backup_id)
     return backup_id
+
+
+def get_latest_backup(service, cfg: Config) -> int:
+    """Return the ID of the most recent SUCCESSFUL backup of the prod instance.
+
+    Used when USE_LATEST_EXISTING_BACKUP is enabled — reuses an existing
+    snapshot instead of creating a new one. Raises SyncError if none exists.
+    Backup IDs are epoch-millis integers, so the largest id is the newest;
+    we sort explicitly rather than trusting API ordering.
+    """
+    log.info(
+        "Looking up most recent successful backup of %s/%s ...",
+        cfg.prod_project, cfg.prod_instance,
+    )
+    try:
+        resp = (
+            service.backupRuns()
+            .list(project=cfg.prod_project, instance=cfg.prod_instance, maxResults=100)
+            .execute(num_retries=5)
+        )
+    except HttpError as exc:
+        _raise_for_http_error(
+            exc, f"listing backups on {cfg.prod_project}/{cfg.prod_instance}"
+        )
+
+    successful = [
+        item for item in resp.get("items", [])
+        if item.get("status") == "SUCCESSFUL" and item.get("id")
+    ]
+    if not successful:
+        raise SyncError(
+            f"No successful backup found for {cfg.prod_project}/{cfg.prod_instance}. "
+            "Create one first, or disable USE_LATEST_EXISTING_BACKUP to create a "
+            "fresh backup on each run."
+        )
+
+    latest = max(successful, key=lambda item: int(item["id"]))
+    backup_id = int(latest["id"])
+    log.info(
+        "Using existing backup %d (type=%s, ended=%s) — it will NOT be deleted.",
+        backup_id, latest.get("type", "?"), latest.get("endTime", "?"),
+    )
+    return backup_id
+
+
+def acquire_backup(service, cfg: Config) -> tuple:
+    """Obtain a backup to restore from. Returns (backup_id, created_by_us).
+
+    - USE_LATEST_EXISTING_BACKUP on  → reuse newest existing backup, owned=False
+    - off (default)                  → create a fresh on-demand backup, owned=True
+
+    The ownership flag tells cleanup whether it may delete the backup: we only
+    ever delete backups this job created, never a pre-existing one.
+    """
+    if cfg.use_latest_existing_backup:
+        return get_latest_backup(service, cfg), False
+    return create_backup(service, cfg), True
 
 
 def restore_to_target(service, backup_id: int, target: Target, cfg: Config) -> None:
@@ -548,9 +617,10 @@ def main() -> None:
         cfg.region,
     )
     log.info(
-        "Config: poll_interval=%ds  timeout=%ds  password_reset=%s",
+        "Config: poll_interval=%ds  timeout=%ds  password_reset=%s  backup=%s",
         cfg.poll_interval, cfg.operation_timeout,
         "enabled" if password_secret else "disabled",
+        "reuse-latest-existing" if cfg.use_latest_existing_backup else "create-new",
     )
 
     service = build_sqladmin()
@@ -565,7 +635,9 @@ def main() -> None:
                 f"Failed to read secret {password_secret}: {exc}"
             ) from exc
 
-    backup_id = create_backup(service, cfg)
+    # Either create a fresh backup (owned, will be deleted) or reuse the latest
+    # existing one (not owned, left in place).
+    backup_id, backup_owned = acquire_backup(service, cfg)
 
     # Restore (and optionally reset password) for each target. A failure on
     # one target is logged and recorded but does not block the others — we
@@ -581,8 +653,11 @@ def main() -> None:
                 log.error("Target %s failed: %s", target, exc)
                 failures.append((target, exc))
     finally:
-        # Always attempt cleanup so backups don't accumulate even on failure.
-        delete_backup(service, backup_id, cfg)
+        # Only delete backups WE created — never a pre-existing one.
+        if backup_owned:
+            delete_backup(service, backup_id, cfg)
+        else:
+            log.info("Backup %d was pre-existing — leaving it in place.", backup_id)
 
     if failures:
         names = ", ".join(str(t) for t, _ in failures)
