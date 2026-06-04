@@ -11,7 +11,7 @@
 set -euo pipefail
 
 # ── Edit these ──────────────────────────────────────────────────────────────
-PROD_PROJECT="bright-modem-498401-f6"
+PROD_PROJECT="project-acc18188-41b4-403b-a21"
 PROD_INSTANCE="production-postgresql"
 
 NONPROD_PROJECT="nonproduction-498401"
