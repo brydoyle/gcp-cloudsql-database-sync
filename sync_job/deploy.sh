@@ -23,13 +23,14 @@ fi
 
 log() { echo "[deploy] $*"; }
 
-read_config() {
-  python3 -c "
+# Parse config.yaml once — output all required values on separate lines,
+# in a fixed order. This avoids spawning 8+ separate python3 processes.
+_raw_config=$(python3 -c "
 import sys
 try:
     import yaml
     with open('${CONFIG_FILE}') as f:
-        cfg = yaml.safe_load(f)
+        cfg = yaml.safe_load(f) or {}
 except ImportError:
     cfg = {}
     with open('${CONFIG_FILE}') as f:
@@ -37,24 +38,31 @@ except ImportError:
             line = line.strip()
             if line and not line.startswith('#') and ':' in line:
                 k, _, v = line.partition(':')
-                cfg[k.strip()] = v.strip().strip('\"')
-key = sys.argv[1]
-val = cfg.get(key, '')
-if not val:
-    print(f'ERROR: {key} is not set in config.yaml', file=sys.stderr)
-    sys.exit(1)
-print(val)
-" "$1"
-}
+                cfg[k.strip()] = v.strip().strip(chr(39) + chr(34))
 
-PROD_PROJECT=$(read_config prod_project_id)
-PROD_INSTANCE=$(read_config prod_instance_name)
-NONPROD_PROJECT=$(read_config nonprod_project_id)
-NONPROD_INSTANCE=$(read_config nonprod_instance_name)
-RUN_REGION=$(read_config region)
-SCHEDULE=$(read_config schedule)
-SCHEDULER_TIMEZONE=$(read_config timezone)
-JOB_NAME=$(read_config job_name)
+required = ['prod_project_id','prod_instance_name','nonprod_project_id',
+            'nonprod_instance_name','region','schedule','timezone','job_name']
+missing = [k for k in required if not cfg.get(k)]
+if missing:
+    for k in missing:
+        print(f'ERROR: {k} is not set in config.yaml', file=sys.stderr)
+    sys.exit(1)
+
+# Output required keys then optional alert_email (may be empty)
+for k in required + ['alert_email']:
+    print(cfg.get(k, ''))
+") || { log "ERROR: Failed to load config.yaml — run 'python3 configure.py' first."; exit 1; }
+
+# Assign values by line position (matches the order printed above)
+PROD_PROJECT=$(    sed -n '1p' <<< "${_raw_config}")
+PROD_INSTANCE=$(   sed -n '2p' <<< "${_raw_config}")
+NONPROD_PROJECT=$( sed -n '3p' <<< "${_raw_config}")
+NONPROD_INSTANCE=$(sed -n '4p' <<< "${_raw_config}")
+RUN_REGION=$(      sed -n '5p' <<< "${_raw_config}")
+SCHEDULE=$(        sed -n '6p' <<< "${_raw_config}")
+SCHEDULER_TIMEZONE=$(sed -n '7p' <<< "${_raw_config}")
+JOB_NAME=$(        sed -n '8p' <<< "${_raw_config}")
+ALERT_EMAIL=$(     sed -n '9p' <<< "${_raw_config}")
 
 IMAGE="gcr.io/${NONPROD_PROJECT}/${JOB_NAME}"
 JOB_SA="${JOB_NAME}@${NONPROD_PROJECT}.iam.gserviceaccount.com"
@@ -175,7 +183,6 @@ gcloud scheduler jobs update http "${JOB_NAME}-nightly" \
   --project="${NONPROD_PROJECT}"
 
 # ── 6. Monitoring & Alerting ──────────────────────────────────────────────────
-ALERT_EMAIL=$(read_config alert_email 2>/dev/null || true)
 
 if [[ -n "${ALERT_EMAIL}" ]]; then
   log "Enabling monitoring APIs..."
