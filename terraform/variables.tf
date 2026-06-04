@@ -19,7 +19,7 @@ variable "prod_instance_name" {
 }
 
 variable "nonprod_project_id" {
-  description = "GCP project ID containing the non-production Cloud SQL instance."
+  description = "Control project: where the Cloud Run Job, service accounts, secret, and monitoring live. Also the default single restore target when nonprod_targets is empty."
   type        = string
 
   validation {
@@ -29,13 +29,22 @@ variable "nonprod_project_id" {
 }
 
 variable "nonprod_instance_name" {
-  description = "Name of the non-production Cloud SQL instance."
+  description = "Default single non-production Cloud SQL instance (used when nonprod_targets is empty)."
   type        = string
 
   validation {
     condition     = can(regex("^[a-z][a-z0-9\\-]{0,96}([a-z0-9])?$", var.nonprod_instance_name))
     error_message = "nonprod_instance_name must start with a lowercase letter, 1–98 chars, letters/digits/hyphens only."
   }
+}
+
+variable "nonprod_targets" {
+  description = "Optional multi-target fan-out. List of restore destinations; if empty, the single nonprod_project_id/nonprod_instance_name pair is used. The job SA is granted cloudsql.admin on each distinct target project."
+  type = list(object({
+    project  = string
+    instance = string
+  }))
+  default = []
 }
 
 variable "region" {

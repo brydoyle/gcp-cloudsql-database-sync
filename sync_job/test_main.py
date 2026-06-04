@@ -18,8 +18,10 @@ from main import (
     Config,
     OperationTimeout,
     SyncError,
+    Target,
     _extract_op_name,
     _fetch_secret,
+    _parse_targets,
     _raise_for_http_error,
     _validate_instance_name,
     _validate_project_id,
@@ -27,8 +29,8 @@ from main import (
     create_backup,
     delete_backup,
     load_config,
-    reset_nonprod_password,
-    restore_to_nonprod,
+    reset_target_password,
+    restore_to_target,
     wait_for_operation,
 )
 
@@ -44,11 +46,12 @@ VALID_ENV = {
     "GCP_REGION": "us-central1",
 }
 
+FAST_TARGET = Target(project="my-nonprod-project", instance="nonprod-db")
+
 FAST_CFG = Config(
     prod_project="my-prod-project",
     prod_instance="prod-db",
-    nonprod_project="my-nonprod-project",
-    nonprod_instance="nonprod-db",
+    nonprod_targets=(FAST_TARGET,),
     region="us-central1",
     poll_interval=0,
     operation_timeout=60,
@@ -81,8 +84,7 @@ class TestLoadConfig:
             cfg = load_config()
         assert cfg.prod_project == "my-prod-project"
         assert cfg.prod_instance == "prod-db"
-        assert cfg.nonprod_project == "my-nonprod-project"
-        assert cfg.nonprod_instance == "nonprod-db"
+        assert cfg.nonprod_targets == (Target("my-nonprod-project", "nonprod-db"),)
         assert cfg.poll_interval == 15
         assert cfg.operation_timeout == 7200
 
@@ -133,6 +135,7 @@ class TestLoadConfig:
             "PROD_INSTANCE_NAME": "same-db",
             "NONPROD_PROJECT_ID": "same-project",
             "NONPROD_INSTANCE_NAME": "same-db",
+            "GCP_REGION": "us-central1",
         }
         with patch.dict("os.environ", env, clear=True):
             with pytest.raises(SystemExit) as exc_info:
@@ -207,6 +210,103 @@ class TestLoadConfig:
             with pytest.raises(SystemExit) as exc_info:
                 load_config()
         assert exc_info.value.code == 1
+
+    def test_multi_target_via_nonprod_targets(self):
+        env = {
+            "PROD_PROJECT_ID": "my-prod-project",
+            "PROD_INSTANCE_NAME": "prod-db",
+            "GCP_REGION": "us-central1",
+            "NONPROD_TARGETS": "dev-project:dev-db,qa-project:qa-db",
+        }
+        with patch.dict("os.environ", env, clear=True):
+            cfg = load_config()
+        assert cfg.nonprod_targets == (
+            Target("dev-project", "dev-db"),
+            Target("qa-project", "qa-db"),
+        )
+
+    def test_nonprod_targets_takes_precedence_over_single(self):
+        env = {
+            **VALID_ENV,  # has single NONPROD_PROJECT_ID / NONPROD_INSTANCE_NAME
+            "NONPROD_TARGETS": "dev-project:dev-db",
+        }
+        with patch.dict("os.environ", env, clear=True):
+            cfg = load_config()
+        assert cfg.nonprod_targets == (Target("dev-project", "dev-db"),)
+
+    def test_multi_target_one_equals_prod_rejected(self):
+        env = {
+            "PROD_PROJECT_ID": "my-prod-project",
+            "PROD_INSTANCE_NAME": "prod-db",
+            "GCP_REGION": "us-central1",
+            "NONPROD_TARGETS": "dev-project:dev-db,my-prod-project:prod-db",
+        }
+        with patch.dict("os.environ", env, clear=True):
+            with pytest.raises(SystemExit) as exc_info:
+                load_config()
+        assert exc_info.value.code == 1
+
+
+# ---------------------------------------------------------------------------
+# _parse_targets
+# ---------------------------------------------------------------------------
+
+class TestParseTargets:
+
+    def test_single_fallback(self):
+        env = {
+            "NONPROD_PROJECT_ID": "my-nonprod-project",
+            "NONPROD_INSTANCE_NAME": "nonprod-db",
+        }
+        with patch.dict("os.environ", env, clear=True):
+            errors: list = []
+            targets = _parse_targets(errors)
+        assert errors == []
+        assert targets == (Target("my-nonprod-project", "nonprod-db"),)
+
+    def test_multi_parses_all(self):
+        env = {"NONPROD_TARGETS": "dev-project:dev-db, qa-project:qa-db"}
+        with patch.dict("os.environ", env, clear=True):
+            errors: list = []
+            targets = _parse_targets(errors)
+        assert errors == []
+        assert len(targets) == 2
+
+    def test_malformed_entry_no_colon(self):
+        env = {"NONPROD_TARGETS": "dev-project-dev-db"}
+        with patch.dict("os.environ", env, clear=True):
+            errors: list = []
+            _parse_targets(errors)
+        assert any("project:instance" in e for e in errors)
+
+    def test_malformed_entry_extra_colon(self):
+        env = {"NONPROD_TARGETS": "dev:db:extra"}
+        with patch.dict("os.environ", env, clear=True):
+            errors: list = []
+            _parse_targets(errors)
+        assert len(errors) >= 1
+
+    def test_duplicate_targets_rejected(self):
+        env = {"NONPROD_TARGETS": "dev-project:dev-db,dev-project:dev-db"}
+        with patch.dict("os.environ", env, clear=True):
+            errors: list = []
+            _parse_targets(errors)
+        assert any("Duplicate" in e for e in errors)
+
+    def test_invalid_target_project_reported(self):
+        env = {"NONPROD_TARGETS": "BAD_PROJECT:dev-db"}
+        with patch.dict("os.environ", env, clear=True):
+            errors: list = []
+            _parse_targets(errors)
+        assert len(errors) >= 1
+
+    def test_empty_entries_skipped(self):
+        env = {"NONPROD_TARGETS": "dev-project:dev-db,,qa-project:qa-db,"}
+        with patch.dict("os.environ", env, clear=True):
+            errors: list = []
+            targets = _parse_targets(errors)
+        assert errors == []
+        assert len(targets) == 2
 
 
 # ---------------------------------------------------------------------------
@@ -508,10 +608,10 @@ class TestCreateBackup:
 
 
 # ---------------------------------------------------------------------------
-# restore_to_nonprod
+# restore_to_target
 # ---------------------------------------------------------------------------
 
-class TestRestoreToNonprod:
+class TestRestoreToTarget:
 
     def test_happy_path(self):
         svc = MagicMock()
@@ -521,7 +621,7 @@ class TestRestoreToNonprod:
         svc.operations.return_value.get.return_value.execute.return_value = {
             "status": "DONE"
         }
-        restore_to_nonprod(svc, 42, FAST_CFG)  # should not raise
+        restore_to_target(svc, 42, FAST_TARGET, FAST_CFG)  # should not raise
 
     def test_http_403_raises_sync_error_with_permissions_hint(self):
         svc = MagicMock()
@@ -529,7 +629,7 @@ class TestRestoreToNonprod:
             make_http_error(403)
         )
         with pytest.raises(SyncError) as exc_info:
-            restore_to_nonprod(svc, 42, FAST_CFG)
+            restore_to_target(svc, 42, FAST_TARGET, FAST_CFG)
         assert "permissions" in str(exc_info.value).lower()
 
     def test_http_400_raises_sync_error_with_version_hint(self):
@@ -538,11 +638,12 @@ class TestRestoreToNonprod:
             make_http_error(400)
         )
         with pytest.raises(SyncError) as exc_info:
-            restore_to_nonprod(svc, 42, FAST_CFG)
+            restore_to_target(svc, 42, FAST_TARGET, FAST_CFG)
         assert "mismatch" in str(exc_info.value).lower()
 
-    def test_restore_body_references_prod_instance(self):
-        """The restore payload must point back at the prod project/instance."""
+    def test_restore_targets_correct_instance(self):
+        """The restore must target the given Target's project/instance and
+        reference prod in the backup context."""
         svc = MagicMock()
         svc.instances.return_value.restoreBackup.return_value.execute.return_value = {
             "name": "operations/restore-op"
@@ -550,9 +651,14 @@ class TestRestoreToNonprod:
         svc.operations.return_value.get.return_value.execute.return_value = {
             "status": "DONE"
         }
-        restore_to_nonprod(svc, 99, FAST_CFG)
+        target = Target("qa-project", "qa-db")
+        restore_to_target(svc, 99, target, FAST_CFG)
 
         _, kwargs = svc.instances.return_value.restoreBackup.call_args
+        # Restore is issued against the target instance...
+        assert kwargs["project"] == "qa-project"
+        assert kwargs["instance"] == "qa-db"
+        # ...but the backup it pulls from points back at prod.
         ctx = kwargs["body"]["restoreBackupContext"]
         assert ctx["project"] == FAST_CFG.prod_project
         assert ctx["instanceId"] == FAST_CFG.prod_instance
@@ -639,10 +745,10 @@ class TestExceptions:
 
 
 # ---------------------------------------------------------------------------
-# reset_nonprod_password / _fetch_secret
+# reset_target_password
 # ---------------------------------------------------------------------------
 
-class TestResetNonprodPassword:
+class TestResetTargetPassword:
 
     def _make_service(self):
         svc = MagicMock()
@@ -656,43 +762,40 @@ class TestResetNonprodPassword:
 
     def test_happy_path_resets_password(self):
         svc = self._make_service()
-        with patch("main._fetch_secret", return_value="s3cr3t"):
-            reset_nonprod_password(svc, FAST_CFG, "projects/proj/secrets/nonprod-pw")
+        reset_target_password(svc, FAST_TARGET, FAST_CFG, "s3cr3t")
 
         _, kwargs = svc.users.return_value.update.call_args
         assert kwargs["name"] == "postgres"
         assert kwargs["body"]["password"] == "s3cr3t"
-        assert kwargs["project"] == FAST_CFG.nonprod_project
-        assert kwargs["instance"] == FAST_CFG.nonprod_instance
+        assert kwargs["project"] == FAST_TARGET.project
+        assert kwargs["instance"] == FAST_TARGET.instance
 
-    def test_secret_fetch_failure_raises_sync_error(self):
+    def test_targets_the_given_target(self):
+        """Password reset must hit the supplied target, not a fixed instance."""
         svc = self._make_service()
-        with patch("main._fetch_secret", side_effect=Exception("permission denied")):
-            with pytest.raises(SyncError) as exc_info:
-                reset_nonprod_password(svc, FAST_CFG, "projects/proj/secrets/nonprod-pw")
-        assert "permission denied" in str(exc_info.value)
-        assert exc_info.value.exit_code == 2
+        target = Target("qa-project", "qa-db")
+        reset_target_password(svc, target, FAST_CFG, "pw")
+        _, kwargs = svc.users.return_value.update.call_args
+        assert kwargs["project"] == "qa-project"
+        assert kwargs["instance"] == "qa-db"
 
     def test_http_403_on_user_update_raises_sync_error(self):
         svc = MagicMock()
         svc.users.return_value.update.return_value.execute.side_effect = make_http_error(403)
-        with patch("main._fetch_secret", return_value="s3cr3t"):
-            with pytest.raises(SyncError) as exc_info:
-                reset_nonprod_password(svc, FAST_CFG, "projects/proj/secrets/nonprod-pw")
+        with pytest.raises(SyncError) as exc_info:
+            reset_target_password(svc, FAST_TARGET, FAST_CFG, "s3cr3t")
         assert exc_info.value.exit_code == 2
 
     def test_http_404_on_user_update_raises_sync_error(self):
         svc = MagicMock()
         svc.users.return_value.update.return_value.execute.side_effect = make_http_error(404)
-        with patch("main._fetch_secret", return_value="s3cr3t"):
-            with pytest.raises(SyncError):
-                reset_nonprod_password(svc, FAST_CFG, "projects/proj/secrets/nonprod-pw")
+        with pytest.raises(SyncError):
+            reset_target_password(svc, FAST_TARGET, FAST_CFG, "s3cr3t")
 
     def test_polls_operation_after_user_update(self):
         """users.update returns an operation — it must be polled to completion."""
         svc = self._make_service()
-        with patch("main._fetch_secret", return_value="pw"):
-            reset_nonprod_password(svc, FAST_CFG, "projects/proj/secrets/s")
+        reset_target_password(svc, FAST_TARGET, FAST_CFG, "pw")
         svc.operations.return_value.get.assert_called()
 
 

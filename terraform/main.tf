@@ -21,6 +21,49 @@ locals {
     "monitoring.googleapis.com",
     "logging.googleapis.com",
   ]
+
+  # Restore targets: the explicit list if provided, else the single pair.
+  targets = length(var.nonprod_targets) > 0 ? var.nonprod_targets : [
+    { project = var.nonprod_project_id, instance = var.nonprod_instance_name }
+  ]
+
+  # Distinct target projects that need the job SA's cloudsql.admin binding.
+  target_projects = distinct([for t in local.targets : t.project])
+
+  # Comma-separated "project:instance" string consumed by main.py.
+  nonprod_targets_env = join(",", [for t in local.targets : "${t.project}:${t.instance}"])
+}
+
+# ── Guard: detect a prior deploy.sh deployment ────────────────────────────────
+#
+# deploy.sh and this module manage the SAME resources — running both against
+# one project causes ownership collisions. deploy.sh labels its Cloud Run job
+# `managed-by=deploy-sh`; if we find that label, fail loudly with guidance.
+#
+# Semantics:
+#   - Fresh project (no job yet): the data source 404s. Inside a `check` block
+#     that surfaces as a one-time WARNING, not an error — apply proceeds.
+#   - Terraform-managed job: no `managed-by=deploy-sh` label → assertion passes.
+#   - deploy.sh-managed job: label present → assertion FAILS with instructions.
+check "no_bash_deploy" {
+  data "google_cloud_run_v2_job" "existing" {
+    name     = var.job_name
+    location = var.region
+    project  = var.nonprod_project_id
+  }
+
+  assert {
+    condition = lookup(
+      data.google_cloud_run_v2_job.existing.effective_labels, "managed-by", ""
+    ) != "deploy-sh"
+    error_message = join(" ", [
+      "Cloud Run job '${var.job_name}' was deployed by deploy.sh",
+      "(label managed-by=deploy-sh). Terraform and deploy.sh must not manage",
+      "the same resources. Either import the existing resources into Terraform",
+      "state, or tear down the deploy.sh resources first.",
+      "See README → 'Choosing a deploy path'.",
+    ])
+  }
 }
 
 # ── APIs ─────────────────────────────────────────────────────────────────────
@@ -59,11 +102,13 @@ resource "google_project_iam_member" "job_prod_cloudsql_admin" {
   member   = "serviceAccount:${google_service_account.job.email}"
 }
 
-# Grant cloudsql.admin on the NONPROD project so the job can trigger restores.
-resource "google_project_iam_member" "job_nonprod_cloudsql_admin" {
-  project = var.nonprod_project_id
-  role    = "roles/cloudsql.admin"
-  member  = "serviceAccount:${google_service_account.job.email}"
+# Grant cloudsql.admin on each distinct target project so the job can trigger
+# restores there. With a single target this is just the control project.
+resource "google_project_iam_member" "job_target_cloudsql_admin" {
+  for_each = toset(local.target_projects)
+  project  = each.value
+  role     = "roles/cloudsql.admin"
+  member   = "serviceAccount:${google_service_account.job.email}"
 }
 
 # ── Scheduler service account ─────────────────────────────────────────────────
@@ -107,13 +152,11 @@ resource "google_cloud_run_v2_job" "sync" {
           name  = "PROD_INSTANCE_NAME"
           value = var.prod_instance_name
         }
+        # Multi-target fan-out: "project:instance,project:instance,..."
+        # main.py prefers this over the single NONPROD_PROJECT_ID pair.
         env {
-          name  = "NONPROD_PROJECT_ID"
-          value = var.nonprod_project_id
-        }
-        env {
-          name  = "NONPROD_INSTANCE_NAME"
-          value = var.nonprod_instance_name
+          name  = "NONPROD_TARGETS"
+          value = local.nonprod_targets_env
         }
         env {
           name  = "GCP_REGION"
@@ -127,14 +170,12 @@ resource "google_cloud_run_v2_job" "sync" {
           name  = "OPERATION_TIMEOUT_SECONDS"
           value = tostring(var.task_timeout_seconds)
         }
+        # Pass the secret RESOURCE NAME (not the value) — main.py fetches the
+        # secret itself via the Secret Manager client using the job SA's
+        # secretAccessor binding. This keeps both deploy paths consistent.
         env {
-          name = "NONPROD_DB_PASSWORD_SECRET"
-          value_source {
-            secret_key_ref {
-              secret  = google_secret_manager_secret.nonprod_db_password.secret_id
-              version = "latest"
-            }
-          }
+          name  = "NONPROD_DB_PASSWORD_SECRET"
+          value = google_secret_manager_secret.nonprod_db_password.id
         }
       }
     }
@@ -143,7 +184,7 @@ resource "google_cloud_run_v2_job" "sync" {
   depends_on = [
     google_project_service.nonprod_apis,
     google_project_iam_member.job_prod_cloudsql_admin,
-    google_project_iam_member.job_nonprod_cloudsql_admin,
+    google_project_iam_member.job_target_cloudsql_admin,
   ]
 }
 
@@ -151,7 +192,7 @@ resource "google_cloud_run_v2_job" "sync" {
 
 resource "google_cloud_scheduler_job" "nightly" {
   name      = "${var.job_name}-nightly"
-  location  = var.region
+  region    = var.region
   project   = var.nonprod_project_id
   schedule  = var.schedule
   time_zone = var.timezone
@@ -187,9 +228,9 @@ resource "google_logging_metric" "sync_failure" {
   ])
 
   metric_descriptor {
-    metric_kind = "DELTA"
-    value_type  = "INT64"
-    unit        = "1"
+    metric_kind  = "DELTA"
+    value_type   = "INT64"
+    unit         = "1"
     display_name = "${var.job_name} failed executions"
   }
 
@@ -220,7 +261,7 @@ resource "google_monitoring_alert_policy" "sync_failure" {
 
     condition_threshold {
       filter          = "metric.type=\"logging.googleapis.com/user/${google_logging_metric.sync_failure.name}\" AND resource.type=\"cloud_run_job\""
-      duration        = "0s"   # alert immediately on first occurrence
+      duration        = "0s" # alert immediately on first occurrence
       comparison      = "COMPARISON_GT"
       threshold_value = 0
 
@@ -235,7 +276,7 @@ resource "google_monitoring_alert_policy" "sync_failure" {
 
   alert_strategy {
     notification_rate_limit {
-      period = "3600s"   # at most one alert per hour
+      period = "3600s" # at most one alert per hour
     }
   }
 
@@ -331,15 +372,6 @@ resource "google_secret_manager_secret_iam_member" "job_secret_accessor" {
   member    = "serviceAccount:${google_service_account.job.email}"
 }
 
-# Grant the job SA permission to reset Cloud SQL users on nonprod.
-resource "google_project_iam_member" "job_nonprod_cloudsql_user_admin" {
-  project = var.nonprod_project_id
-  role    = "roles/cloudsql.admin"  # already granted; listed here for documentation
-  member  = "serviceAccount:${google_service_account.job.email}"
-
-  # No-op if cloudsql.admin is already bound — kept for explicit dependency
-  # tracking and to allow narrowing to a custom role later.
-  lifecycle {
-    ignore_changes = [role]
-  }
-}
+# Note: the job SA's per-target roles/cloudsql.admin bindings
+# (job_target_cloudsql_admin above) already include cloudsql.users.update,
+# which is what reset_target_password needs — no extra binding required.

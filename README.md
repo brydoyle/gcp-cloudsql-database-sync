@@ -59,9 +59,18 @@ Total runtime: ~7–30 minutes depending on database size.
 ### Prerequisites
 
 - `gcloud` CLI authenticated with Owner or sufficient IAM in both projects
+- **The target instance(s) must already exist** — the job restores *into* them, it does not create them (see [Instance provisioning](#instance-provisioning) below)
 - Both Cloud SQL instances must use the same **major PostgreSQL version**
 - Non-prod instance must have equal or **larger** machine tier than prod
 - Prod project must be on a **paid billing account** (Free Trial blocks backup API)
+
+### Instance provisioning
+
+The sync job **restores into existing instances** — it does **not** create them. This is deliberate: provisioning is declarative infrastructure (Terraform's job), while the sync is recurring data movement. Letting the job create instances would mix the two concerns and fight Terraform for ownership.
+
+- **Target doesn't exist?** The job fails that target with `HTTP 404 — instance or backup not found`. Create the instance first.
+- **Provisioning a new target:** use Terraform. See [`terraform/examples/target-instance.tf.example`](terraform/examples/target-instance.tf.example) for a ready-to-use instance resource (correct version/tier/edition matching + `prevent_destroy` guard).
+- **Restore keeps the target's identity:** name, connection name, and IP are unchanged — only the data (and, via Secret Manager, the password) changes. Apps pointing at the target need no reconfiguration.
 
 ### 1. Configure
 
@@ -71,6 +80,8 @@ python3 configure.py
 ```
 
 The wizard prompts for your project IDs, instance names, region, schedule, and alert email. It writes `config.yaml` (for the bash path) and `../terraform/terraform.tfvars` (for the Terraform path) in one step.
+
+> **Pick one deploy path — not both.** `deploy.sh` and Terraform manage the *same* resources. Running both against one project causes ownership collisions. See [Choosing a deploy path](#choosing-a-deploy-path).
 
 ### 2a. Deploy with bash
 
@@ -110,6 +121,89 @@ gcloud logging read \
   --freshness=10m \
   --format='value(timestamp,textPayload)'
 ```
+
+---
+
+## Multi-target restore
+
+One prod backup can fan out to several non-prod targets in a single run (the backup is created once and each target is restored from it).
+
+**Terraform:**
+```hcl
+nonprod_targets = [
+  { project = "acme-dev", instance = "dev-db" },
+  { project = "acme-qa",  instance = "qa-db" },
+]
+```
+
+**Bash / manual** — set the `NONPROD_TARGETS` env var on the job (takes precedence over the single `NONPROD_PROJECT_ID`/`NONPROD_INSTANCE_NAME` pair):
+```bash
+gcloud run jobs update cloudsql-sync --region=us-central1 --project=YOUR_CONTROL_PROJECT \
+  --update-env-vars='NONPROD_TARGETS=acme-dev:dev-db,acme-qa:qa-db'
+```
+
+A failure on one target does not block the others; the job exits non-zero at the end if any target failed, naming them. The job SA needs `cloudsql.admin` on each distinct target project (Terraform grants this automatically).
+
+---
+
+## Triggering a sync
+
+The Cloud Run **Job** and Cloud **Scheduler** are decoupled. The scheduler is only the nightly recurring trigger — the job can be run by anything with `run.invoker`. **The scheduler is optional**; delete it and on-demand runs still work.
+
+| Trigger | How |
+|---|---|
+| **On-demand** | `gcloud run jobs execute cloudsql-sync --region=us-central1 --project=CONTROL_PROJECT --wait` |
+| **Nightly (default)** | Cloud Scheduler → `jobs:run` on the configured cron |
+| **CI/CD** | Same `gcloud run jobs execute` as a pipeline step |
+| **Initial sync at provision time** | Optional — see below |
+
+### Initial sync after provisioning
+
+The job restores into existing instances, so a freshly-provisioned target starts empty. Two ways to populate it:
+
+- **Recommended — run it as a separate action** after `terraform apply`:
+  ```bash
+  gcloud run jobs execute cloudsql-sync --region=us-central1 --project=CONTROL_PROJECT --wait
+  ```
+  Trivially scriptable in a Makefile or post-apply CI step. Keeps provisioning (state) and sync (action) cleanly separated.
+
+- **Optional — sync at `terraform apply`** via a `local-exec` provisioner. See [`terraform/examples/initial-sync.tf.example`](terraform/examples/initial-sync.tf.example). Convenient for "day-0", but it couples `apply` to a 7–30 min data operation, needs `gcloud` on the apply host, and runs once on create (not idempotent infra). Read the caveats in the file before using it.
+
+---
+
+## Choosing a deploy path
+
+`deploy.sh` and Terraform manage the **same** control-plane resources (service accounts, Cloud Run Job, scheduler, IAM, monitoring, secret). They are **mutually exclusive** — pick one owner per project.
+
+| | `deploy.sh` | Terraform |
+|---|---|---|
+| Best for | Quick POCs, single-dev, throwaway envs | Shared / long-lived / prod-adjacent envs |
+| State & drift | None — imperative | Tracked; `plan` shows drift |
+| Change review | Diff the script | PR review on infra |
+| Owns | Same resources | Same resources |
+
+> The Cloud SQL **instances** are owned by neither — you create them separately (manually or via [`terraform/examples/target-instance.tf.example`](terraform/examples/target-instance.tf.example)). Only the control plane is contested.
+
+### Built-in guard
+
+To prevent accidentally running both, `deploy.sh` labels its Cloud Run Job `managed-by=deploy-sh`, and Terraform has a `check` block that **fails `plan`/`apply` with a clear message** if it finds a job carrying that label. (On a fresh project the check emits a one-time "job not found" warning — that's expected and harmless.)
+
+### Migrating bash → Terraform (when a POC graduates)
+
+The contested resources are cheap and stateless, so you have two safe options:
+
+1. **Import** (no downtime) — bring each existing resource into Terraform state:
+   ```bash
+   cd terraform
+   terraform import google_service_account.job          projects/CTRL/serviceAccounts/cloudsql-sync@CTRL.iam.gserviceaccount.com
+   terraform import google_service_account.scheduler    projects/CTRL/serviceAccounts/cloudsql-sync-scheduler@CTRL.iam.gserviceaccount.com
+   terraform import google_cloud_run_v2_job.sync         projects/CTRL/locations/REGION/jobs/cloudsql-sync
+   terraform import google_cloud_scheduler_job.nightly   projects/CTRL/locations/REGION/jobs/cloudsql-sync-nightly
+   # ...repeat for the IAM, logging metric, notification channel, alert policy, secret
+   terraform plan   # should show no/minimal changes once imported
+   ```
+
+2. **Tear down & re-apply** (brief control-plane gap, simplest) — delete the bash-created control-plane resources (the SQL instances are untouched), then `terraform apply` fresh. Re-set the Secret Manager value afterward.
 
 ---
 

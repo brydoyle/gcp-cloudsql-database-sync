@@ -1,0 +1,53 @@
+# ---------------------------------------------------------------------------
+# OPTIONAL EXAMPLE — provisioning a non-production restore target instance.
+#
+# The sync job does NOT create instances. It restores INTO an existing one.
+# New target instances are provisioned declaratively here, via Terraform —
+# separate from the sync job, which only moves data.
+#
+# To use: copy this file to your target project's Terraform config (or into
+# this module if you want it co-managed), rename to `.tf`, and `terraform apply`
+# BEFORE running the sync against it.
+#
+# ⚠️  This makes Terraform OWN the instance — `terraform destroy` would delete
+#     the database. The prevent_destroy lifecycle below guards against that.
+#
+# REQUIREMENTS for a valid restore target (see ADR-001):
+#   - Same MAJOR PostgreSQL version as the prod source instance
+#   - Equal or LARGER machine tier than prod
+#   - Same edition (ENTERPRISE vs ENTERPRISE_PLUS) as prod
+# ---------------------------------------------------------------------------
+
+resource "google_sql_database_instance" "nonprod_target" {
+  name             = "nonproduction-postgresql"
+  project          = "your-nonprod-project-id"
+  region           = "us-central1"
+  database_version = "POSTGRES_18" # MUST match prod's major version
+
+  settings {
+    tier    = "db-perf-optimized-N-2" # MUST be >= prod's tier
+    edition = "ENTERPRISE_PLUS"       # MUST match prod's edition
+
+    # The sync overwrites all data nightly, so PITR/backups on the target
+    # are usually unnecessary — disable to save cost. Adjust to taste.
+    backup_configuration {
+      enabled = false
+    }
+
+    ip_configuration {
+      # POC uses a public IP. For production prefer Private IP + VPC; see
+      # ARCHITECTURE.md "Production gaps — Networking".
+      ipv4_enabled = true
+    }
+  }
+
+  # Guard against accidental `terraform destroy` nuking the database.
+  lifecycle {
+    prevent_destroy = true
+  }
+}
+
+# After applying, point the sync job at this instance:
+#   - single target: nonprod_instance_name = "nonproduction-postgresql"
+#   - multi-target:   add { project = "...", instance = "nonproduction-postgresql" }
+#                     to nonprod_targets
