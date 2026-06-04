@@ -59,9 +59,18 @@ Total runtime: ~7–30 minutes depending on database size.
 ### Prerequisites
 
 - `gcloud` CLI authenticated with Owner or sufficient IAM in both projects
+- **The target instance(s) must already exist** — the job restores *into* them, it does not create them (see [Instance provisioning](#instance-provisioning) below)
 - Both Cloud SQL instances must use the same **major PostgreSQL version**
 - Non-prod instance must have equal or **larger** machine tier than prod
 - Prod project must be on a **paid billing account** (Free Trial blocks backup API)
+
+### Instance provisioning
+
+The sync job **restores into existing instances** — it does **not** create them. This is deliberate: provisioning is declarative infrastructure (Terraform's job), while the sync is recurring data movement. Letting the job create instances would mix the two concerns and fight Terraform for ownership.
+
+- **Target doesn't exist?** The job fails that target with `HTTP 404 — instance or backup not found`. Create the instance first.
+- **Provisioning a new target:** use Terraform. See [`terraform/examples/target-instance.tf.example`](terraform/examples/target-instance.tf.example) for a ready-to-use instance resource (correct version/tier/edition matching + `prevent_destroy` guard).
+- **Restore keeps the target's identity:** name, connection name, and IP are unchanged — only the data (and, via Secret Manager, the password) changes. Apps pointing at the target need no reconfiguration.
 
 ### 1. Configure
 

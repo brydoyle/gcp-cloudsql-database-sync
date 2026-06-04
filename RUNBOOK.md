@@ -122,14 +122,14 @@ gcloud projects add-iam-policy-binding PROD_PROJECT \
 
 #### HTTP 404 — Not found
 
-Instance name in config doesn't match what's in Cloud SQL.
+Either the instance name in config doesn't match Cloud SQL, **or the target instance doesn't exist yet**. The job restores *into* existing instances — it never creates them.
 ```bash
 gcloud sql instances list --project=PROD_PROJECT
 gcloud sql instances list --project=NONPROD_PROJECT
-
-# Fix: update config.yaml and redeploy
-cd sync_job && python3 configure.py && bash deploy.sh
 ```
+
+- **Name mismatch / typo:** fix and redeploy → `cd sync_job && python3 configure.py && bash deploy.sh`
+- **Target genuinely missing:** provision it with Terraform first (see `terraform/examples/target-instance.tf.example`), then re-run the sync. Do **not** expect the job to create it — provisioning is intentionally Terraform's responsibility, not the job's.
 
 #### HTTP 409 — Conflict
 
