@@ -195,10 +195,13 @@ if [[ -n "${ALERT_EMAIL}" ]]; then
     --project="${NONPROD_PROJECT}"
 
   log "Creating email notification channel for ${ALERT_EMAIL}..."
+  # Filter by display name (label filtering is unreliable across gcloud versions).
+  # Redirect stderr to /dev/null to prevent gcloud self-update noise from
+  # contaminating the captured output.
   CHANNEL_NAME=$(gcloud beta monitoring channels list \
-    --filter="type=email AND labels.email_address=${ALERT_EMAIL}" \
+    --filter="displayName='CloudSQL Sync Alerts'" \
     --format="value(name)" \
-    --project="${NONPROD_PROJECT}" | head -1)
+    --project="${NONPROD_PROJECT}" 2>/dev/null | head -1)
 
   if [[ -z "${CHANNEL_NAME}" ]]; then
     CHANNEL_NAME=$(gcloud beta monitoring channels create \
@@ -206,7 +209,7 @@ if [[ -n "${ALERT_EMAIL}" ]]; then
       --type=email \
       --channel-labels="email_address=${ALERT_EMAIL}" \
       --format="value(name)" \
-      --project="${NONPROD_PROJECT}")
+      --project="${NONPROD_PROJECT}" 2>/dev/null)
     log "Created notification channel: ${CHANNEL_NAME}"
   else
     log "Reusing existing notification channel: ${CHANNEL_NAME}"
