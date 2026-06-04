@@ -337,11 +337,17 @@ def create_backup(service, cfg: Config) -> int:
     log.info("Backup operation started: %s", op_name)
     result = wait_for_operation(service, cfg.prod_project, op_name, cfg)
 
+    # The Cloud SQL API returns the backup ID in backupContext.backupId.
+    # Older API versions used targetId — check both for compatibility.
+    raw_id = (
+        (result.get("backupContext") or {}).get("backupId")
+        or result.get("targetId")
+    )
     try:
-        backup_id = int(result.get("targetId") or "")
+        backup_id = int(raw_id or "")
     except (ValueError, TypeError) as exc:
         raise SyncError(
-            f"Operation {op_name} completed but targetId is missing or non-integer: {result}",
+            f"Operation {op_name} completed but backup ID is missing or non-integer: {result}",
             exit_code=4,
         ) from exc
 
