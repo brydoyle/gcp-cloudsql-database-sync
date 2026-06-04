@@ -11,11 +11,11 @@
 set -euo pipefail
 
 # ── Edit these ──────────────────────────────────────────────────────────────
-PROD_PROJECT="your-prod-project-id"
-PROD_INSTANCE="your-prod-instance-name"
+PROD_PROJECT="bright-modem-498401-f6"
+PROD_INSTANCE="production-postgresql"
 
-NONPROD_PROJECT="your-nonprod-project-id"
-NONPROD_INSTANCE="your-nonprod-instance-name"
+NONPROD_PROJECT="nonproduction-498401"
+NONPROD_INSTANCE="nonproduction-postgresql"
 
 # Where to deploy the Cloud Run Job.
 RUN_REGION="us-central1"
@@ -48,6 +48,22 @@ log "Creating job service account ${JOB_SA}..."
 gcloud iam service-accounts create "${JOB_NAME}" \
   --display-name="CloudSQL Sync Job" \
   --project="${NONPROD_PROJECT}" 2>/dev/null || true
+
+# Wait for the service account to propagate before binding IAM policies.
+# GCP has an eventual-consistency delay after SA creation.
+log "Waiting for service account to propagate..."
+for i in $(seq 1 10); do
+  if gcloud iam service-accounts describe "${JOB_SA}" --project="${NONPROD_PROJECT}" &>/dev/null; then
+    log "Service account ready."
+    break
+  fi
+  if [ "$i" -eq 10 ]; then
+    log "ERROR: Service account ${JOB_SA} did not become available after 30s."
+    exit 1
+  fi
+  log "  not ready yet, retrying in 3s... (attempt ${i}/10)"
+  sleep 3
+done
 
 # Create backups on prod.
 gcloud projects add-iam-policy-binding "${PROD_PROJECT}" \
@@ -88,6 +104,20 @@ log "Creating scheduler service account ${SCHEDULER_SA}..."
 gcloud iam service-accounts create "${JOB_NAME}-scheduler" \
   --display-name="CloudSQL Sync Scheduler" \
   --project="${NONPROD_PROJECT}" 2>/dev/null || true
+
+log "Waiting for scheduler service account to propagate..."
+for i in $(seq 1 10); do
+  if gcloud iam service-accounts describe "${SCHEDULER_SA}" --project="${NONPROD_PROJECT}" &>/dev/null; then
+    log "Scheduler service account ready."
+    break
+  fi
+  if [ "$i" -eq 10 ]; then
+    log "ERROR: Service account ${SCHEDULER_SA} did not become available after 30s."
+    exit 1
+  fi
+  log "  not ready yet, retrying in 3s... (attempt ${i}/10)"
+  sleep 3
+done
 
 gcloud projects add-iam-policy-binding "${NONPROD_PROJECT}" \
   --member="serviceAccount:${SCHEDULER_SA}" \
