@@ -15,6 +15,7 @@ import argparse
 import os
 import re
 import sys
+from typing import Optional
 
 # ---------------------------------------------------------------------------
 # Optional PyYAML — fall back to a simple writer if not installed
@@ -149,7 +150,9 @@ def _load_yaml(path: str) -> dict:
             line = line.strip()
             if line and not line.startswith("#") and ":" in line:
                 k, _, v = line.partition(":")
-                config[k.strip()] = v.strip()
+                # Strip surrounding whitespace and quotes so values like
+                # schedule: "0 2 * * *" load as  0 2 * * *
+                config[k.strip()] = v.strip().strip("\"'")
     return config
 
 
@@ -170,7 +173,7 @@ def _write_yaml(path: str, config: dict) -> None:
 # Prompt helper
 # ---------------------------------------------------------------------------
 
-def _prompt(field: dict, current: str | None, non_interactive: bool) -> str:
+def _prompt(field: dict, current: Optional[str], non_interactive: bool) -> str:
     default = current or field.get("default", "")
     hint    = field.get("hint", "")
     example = field.get("example", "")
@@ -178,6 +181,11 @@ def _prompt(field: dict, current: str | None, non_interactive: bool) -> str:
     if non_interactive:
         if not default:
             print(f"  ERROR: {field['label']} is required but not set.", file=sys.stderr)
+            sys.exit(1)
+        # Validate even in non-interactive mode so bad config.yaml values are caught.
+        error = field["validate"](default)
+        if error:
+            print(f"  ERROR: {field['label']} — {error} (got: {default!r})", file=sys.stderr)
             sys.exit(1)
         return default
 
