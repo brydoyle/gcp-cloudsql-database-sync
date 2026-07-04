@@ -46,6 +46,7 @@ Total runtime: ~7–30 minutes depending on database size.
 │   ├── outputs.tf           # Useful outputs + gcloud commands
 │   ├── versions.tf          # Provider pins
 │   └── terraform.tfvars.example
+├── poc.sh                   # Rerunnable POC harness (up / test / down / status)
 ├── README.md                # This file
 ├── ARCHITECTURE.md          # Design decisions and trade-offs
 ├── DEPLOY_CHECKLIST.md      # Pre/post deployment verification
@@ -71,6 +72,19 @@ The sync job **restores into existing instances** — it does **not** create the
 - **Target doesn't exist?** The job fails that target with `HTTP 404 — instance or backup not found`. Create the instance first.
 - **Provisioning a new target:** use Terraform. See [`terraform/examples/target-instance.tf.example`](terraform/examples/target-instance.tf.example) for a ready-to-use instance resource (correct version/tier/edition matching + `prevent_destroy` guard).
 - **Restore keeps the target's identity:** name, connection name, and IP are unchanged — only the data (and, via Secret Manager, the password) changes. Apps pointing at the target need no reconfiguration.
+
+### Fastest path: the rerunnable POC harness
+
+Once `configure.py` has been run, `poc.sh` stands up, exercises, and tears down the **entire** POC — instances included:
+
+```bash
+bash poc.sh up       # create both SQL instances, deploy, wire the password secret
+bash poc.sh test     # run one sync; asserts restore + password reset + SQL verification
+bash poc.sh down     # delete instances (disks & backups included), pause schedule → ~pennies/mo
+bash poc.sh status   # what exists right now, and whether it's costing anything
+```
+
+Idempotent in both directions: `up` skips what exists, `down` ignores what's gone. The POC uses the smallest valid tier (`db-perf-optimized-N-2`) for **both** instances — the target only has to be ≥ prod, and a POC has no reason to pay for more.
 
 ### 1. Configure
 
