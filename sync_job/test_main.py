@@ -7,6 +7,7 @@ Coverage:  pytest sync_job/test_main.py --cov=sync_job/main --cov-report=term-mi
 
 import http
 import io
+import logging
 import unittest
 from unittest.mock import MagicMock, call, patch
 
@@ -965,3 +966,40 @@ class TestAcquireBackup:
         assert owned is False
         # Must NOT create a new backup when reusing.
         svc.backupRuns.return_value.insert.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Public-egress runtime warning
+# ---------------------------------------------------------------------------
+
+class TestPublicNetworkWarning:
+    """main() must warn when the job's egress is public (SYNC_NETWORK_MODE
+    unset or != 'private'), and stay quiet when private networking is set."""
+
+    WARNING_FRAGMENT = "egress is PUBLIC"
+
+    def _run_main(self, extra_env, caplog):
+        env = {**VALID_ENV, **extra_env}
+        with patch.dict("os.environ", env, clear=True), \
+             patch("main.build_sqladmin", return_value=MagicMock()), \
+             patch("main.acquire_backup", return_value=(1, True)), \
+             patch("main.restore_to_target"), \
+             patch("main.delete_backup"):
+            with caplog.at_level(logging.WARNING):
+                main.main()
+        return caplog.text
+
+    def test_warns_when_mode_unset(self, caplog):
+        assert self.WARNING_FRAGMENT in self._run_main({}, caplog)
+
+    def test_warns_when_mode_public(self, caplog):
+        assert self.WARNING_FRAGMENT in self._run_main(
+            {"SYNC_NETWORK_MODE": "public"}, caplog)
+
+    def test_silent_when_mode_private(self, caplog):
+        assert self.WARNING_FRAGMENT not in self._run_main(
+            {"SYNC_NETWORK_MODE": "private"}, caplog)
+
+    def test_private_is_case_insensitive(self, caplog):
+        assert self.WARNING_FRAGMENT not in self._run_main(
+            {"SYNC_NETWORK_MODE": " Private "}, caplog)

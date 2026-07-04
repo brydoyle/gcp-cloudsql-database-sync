@@ -36,6 +36,9 @@ locals {
   # On-demand mode (schedule == "on-demand" or empty) creates no scheduler.
   create_scheduler = !contains(["", "on-demand"], var.schedule)
 
+  # Private networking is opt-in: connector OR direct VPC egress. Blank = public.
+  use_vpc = var.vpc_connector != "" || var.vpc_network != ""
+
   # Absence-alert window derived from the schedule cadence (plus slack for a
   # slow run), so a weekly schedule doesn't page daily. Cloud Monitoring caps
   # absence durations at 24.5 days. No absence alert at all when on-demand.
@@ -86,6 +89,16 @@ check "no_bash_deploy" {
       "state, or tear down the deploy.sh resources first.",
       "See README → 'Choosing a deploy path'.",
     ])
+  }
+}
+
+# ── Warning: public egress ────────────────────────────────────────────────────
+# A failed check assertion is a WARNING (not an error): every plan/apply on a
+# public-egress config surfaces this, without blocking POC use.
+check "public_networking" {
+  assert {
+    condition     = local.use_vpc
+    error_message = "Job egress is PUBLIC (no vpc_connector or vpc_network set). Fine for a POC; for production configure private networking — see README 'Networking'."
   }
 }
 
@@ -166,6 +179,25 @@ resource "google_cloud_run_v2_job" "sync" {
 
       timeout = "${tostring(var.task_timeout_seconds)}s"
 
+      # Optional private networking — omitted entirely when no VPC vars are
+      # set, so the module works in any environment with zero prerequisites.
+      dynamic "vpc_access" {
+        for_each = local.use_vpc ? [1] : []
+        content {
+          connector = var.vpc_connector != "" ? var.vpc_connector : null
+          egress    = var.vpc_egress
+
+          # Direct VPC egress (used when vpc_network is set instead of a connector)
+          dynamic "network_interfaces" {
+            for_each = var.vpc_network != "" ? [1] : []
+            content {
+              network    = var.vpc_network
+              subnetwork = var.vpc_subnetwork != "" ? var.vpc_subnetwork : null
+            }
+          }
+        }
+      }
+
       containers {
         image = var.container_image
 
@@ -199,6 +231,11 @@ resource "google_cloud_run_v2_job" "sync" {
           name  = "USE_LATEST_EXISTING_BACKUP"
           value = tostring(var.use_latest_existing_backup)
         }
+        # Lets the job warn at runtime when its egress is public.
+        env {
+          name  = "SYNC_NETWORK_MODE"
+          value = local.use_vpc ? "private" : "public"
+        }
         # Pass the secret RESOURCE NAME (not the value) — main.py fetches the
         # secret itself via the Secret Manager client using the job SA's
         # secretAccessor binding. This keeps both deploy paths consistent.
@@ -215,6 +252,13 @@ resource "google_cloud_run_v2_job" "sync" {
     google_project_iam_member.job_prod_cloudsql_admin,
     google_project_iam_member.job_target_cloudsql_admin,
   ]
+
+  lifecycle {
+    precondition {
+      condition     = !(var.vpc_connector != "" && var.vpc_network != "")
+      error_message = "vpc_connector and vpc_network are mutually exclusive — set one (connector-based egress) or the other (Direct VPC egress), not both."
+    }
+  }
 }
 
 # ── Cloud Scheduler ───────────────────────────────────────────────────────────

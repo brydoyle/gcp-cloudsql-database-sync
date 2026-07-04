@@ -49,7 +49,8 @@ if missing:
     sys.exit(1)
 
 # Output required keys, then optional keys (may be empty)
-for k in required + ['alert_email', 'use_latest_existing_backup']:
+for k in required + ['alert_email', 'use_latest_existing_backup',
+                     'vpc_connector', 'vpc_network', 'vpc_subnetwork', 'vpc_egress']:
     print(cfg.get(k, ''))
 ") || { log "ERROR: Failed to load config.yaml — run 'python3 configure.py' first."; exit 1; }
 
@@ -64,8 +65,37 @@ SCHEDULER_TIMEZONE=$(sed -n '7p' <<< "${_raw_config}")
 JOB_NAME=$(        sed -n '8p' <<< "${_raw_config}")
 ALERT_EMAIL=$(     sed -n '9p' <<< "${_raw_config}")
 USE_LATEST_BACKUP=$(sed -n '10p' <<< "${_raw_config}")
-# Default to false when unset/blank
+VPC_CONNECTOR=$(   sed -n '11p' <<< "${_raw_config}")
+VPC_NETWORK=$(     sed -n '12p' <<< "${_raw_config}")
+VPC_SUBNETWORK=$(  sed -n '13p' <<< "${_raw_config}")
+VPC_EGRESS=$(      sed -n '14p' <<< "${_raw_config}")
+# Defaults when unset/blank
 USE_LATEST_BACKUP="${USE_LATEST_BACKUP:-false}"
+VPC_EGRESS="${VPC_EGRESS:-private-ranges-only}"
+
+# Optional private networking for the Cloud Run Job. Blank = public egress
+# (works in any environment with no VPC prerequisites).
+if [[ -n "${VPC_CONNECTOR}" && -n "${VPC_NETWORK}" ]]; then
+  log "ERROR: vpc_connector and vpc_network are mutually exclusive — set one or the other."
+  exit 1
+fi
+VPC_ARGS=()
+NETWORK_MODE="public"
+SYNC_NET="public"
+if [[ -n "${VPC_CONNECTOR}" ]]; then
+  VPC_ARGS+=("--vpc-connector=${VPC_CONNECTOR}" "--vpc-egress=${VPC_EGRESS}")
+  NETWORK_MODE="vpc-connector (${VPC_CONNECTOR}, egress=${VPC_EGRESS})"
+  SYNC_NET="private"
+elif [[ -n "${VPC_NETWORK}" ]]; then
+  VPC_ARGS+=("--network=${VPC_NETWORK}" "--vpc-egress=${VPC_EGRESS}")
+  [[ -n "${VPC_SUBNETWORK}" ]] && VPC_ARGS+=("--subnet=${VPC_SUBNETWORK}")
+  NETWORK_MODE="direct-vpc (${VPC_NETWORK}, egress=${VPC_EGRESS})"
+  SYNC_NET="private"
+fi
+if [ "${SYNC_NET}" = "public" ]; then
+  log "WARNING: job egress is PUBLIC (no VPC configured). Fine for a POC;"
+  log "  for production set vpc_connector or vpc_network in config.yaml."
+fi
 
 IMAGE="gcr.io/${NONPROD_PROJECT}/${JOB_NAME}"
 JOB_SA="${JOB_NAME}@${NONPROD_PROJECT}.iam.gserviceaccount.com"
@@ -77,6 +107,7 @@ log "  Nonprod: ${NONPROD_PROJECT} / ${NONPROD_INSTANCE}"
 log "  Region:  ${RUN_REGION}"
 log "  Schedule: ${SCHEDULE} (${SCHEDULER_TIMEZONE})"
 log "  Backup:  $([ "${USE_LATEST_BACKUP}" = "true" ] && echo 'reuse latest existing' || echo 'create new')"
+log "  Network: ${NETWORK_MODE}"
 
 # ── 1. Enable required APIs ──────────────────────────────────────────────────
 log "Enabling APIs..."
@@ -140,7 +171,9 @@ PROD_INSTANCE_NAME=${PROD_INSTANCE},\
 NONPROD_PROJECT_ID=${NONPROD_PROJECT},\
 NONPROD_INSTANCE_NAME=${NONPROD_INSTANCE},\
 GCP_REGION=${RUN_REGION},\
-USE_LATEST_EXISTING_BACKUP=${USE_LATEST_BACKUP}" \
+USE_LATEST_EXISTING_BACKUP=${USE_LATEST_BACKUP},\
+SYNC_NETWORK_MODE=${SYNC_NET}" \
+  ${VPC_ARGS[@]+"${VPC_ARGS[@]}"} \
   --project="${NONPROD_PROJECT}"
 
 # ── 5. Cloud Scheduler ───────────────────────────────────────────────────────
