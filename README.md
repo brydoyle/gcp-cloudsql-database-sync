@@ -81,6 +81,7 @@ Once `configure.py` has been run, `poc.sh` stands up, exercises, and tears down 
 bash poc.sh up       # create both SQL instances, deploy, wire the password secret
 bash poc.sh test     # run one sync; asserts restore + password reset + SQL verification
 bash poc.sh down     # delete instances (disks & backups included), pause schedule → ~pennies/mo
+bash poc.sh purge    # down + delete secret, images, build bucket, job, scheduler, alerts, SAs → $0
 bash poc.sh status   # what exists right now, and whether it's costing anything
 ```
 

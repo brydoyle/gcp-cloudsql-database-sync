@@ -9,6 +9,9 @@
 #                        password, and passed SQL verification.
 #   bash poc.sh down     Delete both instances (disks + backups go with
 #                        them) and pause the schedule. → pennies/month.
+#   bash poc.sh purge    down + remove EVERYTHING billable: secret, images,
+#                        build bucket, job, scheduler, alerts, metrics,
+#                        channel, service accounts. → $0.
 #   bash poc.sh status   Show what exists and what it costs.
 #
 # Reads project/instance names from sync_job/config.yaml (run
@@ -187,6 +190,87 @@ cmd_down() {
   log "   Bring it back any time with: bash poc.sh up"
 }
 
+cmd_purge() {
+  log "── POC purge: removing EVERYTHING billable, including scaffolding ──"
+  cmd_down
+
+  log "Deleting scheduler job..."
+  gcloud scheduler jobs delete "${JOB_NAME}-nightly" --location="${REGION}" \
+    --project="${NONPROD_PROJECT}" --quiet 2>/dev/null || log "  (already gone)"
+
+  log "Deleting Cloud Run job..."
+  gcloud run jobs delete "${JOB_NAME}" --region="${REGION}" \
+    --project="${NONPROD_PROJECT}" --quiet 2>/dev/null || log "  (already gone)"
+
+  log "Deleting secret ${SECRET_NAME}..."
+  gcloud secrets delete "${SECRET_NAME}" --project="${NONPROD_PROJECT}" --quiet 2>/dev/null \
+    || log "  (already gone)"
+
+  log "Deleting container images..."
+  local digests
+  digests=$(gcloud container images list-tags "gcr.io/${NONPROD_PROJECT}/${JOB_NAME}" \
+    --format='get(digest)' 2>/dev/null || true)
+  if [ -n "${digests}" ]; then
+    while read -r d; do
+      [ -n "${d}" ] && gcloud container images delete \
+        "gcr.io/${NONPROD_PROJECT}/${JOB_NAME}@${d}" \
+        --force-delete-tags --quiet 2>/dev/null || true
+    done <<< "${digests}"
+    log "  images deleted."
+  else
+    log "  (no images)"
+  fi
+
+  log "Deleting Cloud Build source bucket..."
+  gcloud storage rm -r "gs://${NONPROD_PROJECT}_cloudbuild" --project="${NONPROD_PROJECT}" 2>/dev/null \
+    || log "  (already gone)"
+
+  log "Deleting alert policies (before their channel/metrics)..."
+  # List everything and match client-side — the server-side filter dialect
+  # varies by API surface and fails silently on unsupported functions.
+  local policies
+  policies=$(gcloud alpha monitoring policies list \
+    --format="csv[no-heading](name,displayName)" \
+    --project="${NONPROD_PROJECT}" 2>/dev/null \
+    | awk -F, -v j="${JOB_NAME} " 'index($2, j) == 1 {print $1}' || true)
+  if [ -n "${policies}" ]; then
+    while read -r pol; do
+      [ -n "${pol}" ] && gcloud alpha monitoring policies delete "${pol}" --quiet \
+        --project="${NONPROD_PROJECT}" 2>/dev/null || true
+    done <<< "${policies}"
+    log "  policies deleted."
+  else
+    log "  (no policies)"
+  fi
+
+  log "Deleting notification channel..."
+  local channel
+  channel=$(gcloud beta monitoring channels list \
+    --format="csv[no-heading](name,displayName)" \
+    --project="${NONPROD_PROJECT}" 2>/dev/null \
+    | awk -F, '$2 == "CloudSQL Sync Alerts" {print $1; exit}' || true)
+  [ -n "${channel}" ] && gcloud beta monitoring channels delete "${channel}" --quiet \
+    --project="${NONPROD_PROJECT}" 2>/dev/null && log "  channel deleted." || log "  (no channel)"
+
+  log "Deleting log-based metrics..."
+  for m in "${JOB_NAME}-failure" "${JOB_NAME}-success"; do
+    gcloud logging metrics delete "${m}" --project="${NONPROD_PROJECT}" --quiet 2>/dev/null || true
+  done
+
+  log "Deleting service accounts..."
+  for sa in "${JOB_NAME}@${NONPROD_PROJECT}.iam.gserviceaccount.com" \
+            "${JOB_NAME}-scheduler@${NONPROD_PROJECT}.iam.gserviceaccount.com"; do
+    gcloud iam service-accounts delete "${sa}" --project="${NONPROD_PROJECT}" --quiet 2>/dev/null \
+      || log "  (${sa} already gone)"
+  done
+  log "  NOTE: the job SA's cross-project binding on ${PROD_PROJECT} becomes a"
+  log "  harmless 'deleted:' tombstone; remove it in the console if you want zero trace."
+
+  log ""
+  log "✅ POC fully purged — nothing billable remains."
+  log "   Rebuild everything with: bash poc.sh up"
+}
+
 cmd_status() {
   log "── POC status ──"
   for pair in "${PROD_PROJECT}:${PROD_INSTANCE}" "${NONPROD_PROJECT}:${NONPROD_INSTANCE}"; do
@@ -208,6 +292,7 @@ case "${1:-}" in
   up)     cmd_up ;;
   test)   cmd_test ;;
   down)   cmd_down ;;
+  purge)  cmd_purge ;;
   status) cmd_status ;;
-  *)      echo "Usage: bash poc.sh {up|test|down|status}"; exit 1 ;;
+  *)      echo "Usage: bash poc.sh {up|test|down|purge|status}"; exit 1 ;;
 esac
