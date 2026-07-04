@@ -286,25 +286,54 @@ EOF
     --log-filter="resource.type=\"cloud_run_job\" AND resource.labels.job_name=\"${JOB_NAME}\" AND textPayload=\"Sync finished successfully.\"" \
     --project="${NONPROD_PROJECT}"
 
-  # Absence alert — fires if no successful sync in 25 hours.
-  ABSENCE_POLICY_EXISTS=$(gcloud alpha monitoring policies list \
+  # Absence alert — fires if no successful sync within one schedule cadence
+  # (plus slack). Window is derived from the schedule so a weekly schedule
+  # doesn't page daily. Skipped entirely for on-demand: no cadence to miss.
+  # Remove the legacy fixed-25h policy from older deploys if present.
+  STALE_POLICY=$(gcloud alpha monitoring policies list \
     --filter="displayName='${JOB_NAME} sync not run in 25h'" \
     --format="value(name)" \
     --project="${NONPROD_PROJECT}" 2>/dev/null | head -1)
+  if [[ -n "${STALE_POLICY}" ]]; then
+    gcloud alpha monitoring policies delete "${STALE_POLICY}" --quiet \
+      --project="${NONPROD_PROJECT}" 2>/dev/null \
+      && log "Removed legacy fixed-25h absence policy." || true
+  fi
 
-  if [[ -z "${ABSENCE_POLICY_EXISTS}" ]]; then
-    ABSENCE_JSON=$(cat <<EOF
+  if [ "${SCHEDULE}" = "on-demand" ]; then
+    log "Schedule is on-demand — skipping the absence alert (no cadence to miss)."
+  else
+    # Derive the window from the cron's day-of-month / day-of-week fields.
+    CRON_DOM=$(echo "${SCHEDULE}" | awk '{print $3}')
+    CRON_DOW=$(echo "${SCHEDULE}" | awk '{print $5}')
+    if [ "${CRON_DOW}" = "*" ] && [ "${CRON_DOM}" = "*" ]; then
+      ABSENCE_SECONDS=90000;   ABSENCE_LABEL="25 hours"    # daily or finer
+    elif [ "${CRON_DOW}" = "1-5" ]; then
+      ABSENCE_SECONDS=262800;  ABSENCE_LABEL="73 hours"    # weekdays (weekend gap)
+    elif [ "${CRON_DOM}" != "*" ]; then
+      ABSENCE_SECONDS=2116800; ABSENCE_LABEL="24.5 days"   # monthly (API max)
+    else
+      ABSENCE_SECONDS=691200;  ABSENCE_LABEL="8 days"      # weekly
+    fi
+
+    ABSENCE_POLICY_EXISTS=$(gcloud alpha monitoring policies list \
+      --filter="displayName='${JOB_NAME} sync overdue'" \
+      --format="value(name)" \
+      --project="${NONPROD_PROJECT}" 2>/dev/null | head -1)
+
+    if [[ -z "${ABSENCE_POLICY_EXISTS}" ]]; then
+      ABSENCE_JSON=$(cat <<EOF
 {
-  "displayName": "${JOB_NAME} sync not run in 25h",
+  "displayName": "${JOB_NAME} sync overdue",
   "documentation": {
-    "content": "The ${JOB_NAME} sync has not completed successfully in 25 hours. Check the scheduler: https://console.cloud.google.com/run/jobs?project=${NONPROD_PROJECT}",
+    "content": "The ${JOB_NAME} sync has not completed successfully in ${ABSENCE_LABEL} (schedule: ${SCHEDULE}). Check the scheduler: https://console.cloud.google.com/run/jobs?project=${NONPROD_PROJECT}",
     "mimeType": "text/markdown"
   },
   "conditions": [{
-    "displayName": "No successful sync in last 25 hours",
+    "displayName": "No successful sync in last ${ABSENCE_LABEL}",
     "conditionAbsent": {
       "filter": "metric.type=\"logging.googleapis.com/user/${SUCCESS_METRIC}\" AND resource.type=\"cloud_run_job\"",
-      "duration": "90000s",
+      "duration": "${ABSENCE_SECONDS}s",
       "aggregations": [{"alignmentPeriod": "3600s", "perSeriesAligner": "ALIGN_COUNT"}]
     }
   }],
@@ -313,11 +342,14 @@ EOF
 }
 EOF
 )
-    echo "${ABSENCE_JSON}" | gcloud alpha monitoring policies create \
-      --policy-from-file=- --project="${NONPROD_PROJECT}"
-    log "Absence alert policy created (fires if no sync in 25h)."
-  else
-    log "Absence alert policy already exists."
+      echo "${ABSENCE_JSON}" | gcloud alpha monitoring policies create \
+        --policy-from-file=- --project="${NONPROD_PROJECT}"
+      log "Absence alert policy created (fires if no sync in ${ABSENCE_LABEL})."
+    else
+      log "Absence alert policy already exists."
+      log "  NOTE: if you changed the schedule cadence, delete it and re-run to refresh the window:"
+      log "  gcloud alpha monitoring policies delete ${ABSENCE_POLICY_EXISTS} --project=${NONPROD_PROJECT}"
+    fi
   fi
 
 else
