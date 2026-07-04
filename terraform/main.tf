@@ -35,6 +35,26 @@ locals {
 
   # On-demand mode (schedule == "on-demand" or empty) creates no scheduler.
   create_scheduler = !contains(["", "on-demand"], var.schedule)
+
+  # Absence-alert window derived from the schedule cadence (plus slack for a
+  # slow run), so a weekly schedule doesn't page daily. Cloud Monitoring caps
+  # absence durations at 24.5 days. No absence alert at all when on-demand.
+  sched_fields = split(" ", trimspace(var.schedule))
+  sched_dom    = length(local.sched_fields) == 5 ? local.sched_fields[2] : "*"
+  sched_dow    = length(local.sched_fields) == 5 ? local.sched_fields[4] : "*"
+
+  absence_seconds = (
+    local.sched_dow == "*" && local.sched_dom == "*" ? 90000 : # daily/finer: 25h
+    local.sched_dow == "1-5" ? 262800 :                        # weekdays: 73h (weekend gap)
+    local.sched_dom != "*" ? 2116800 :                         # monthly: 24.5d (API max)
+    691200                                                     # weekly: 8 days
+  )
+  absence_label = (
+    local.absence_seconds == 90000 ? "25 hours" :
+    local.absence_seconds == 262800 ? "73 hours" :
+    local.absence_seconds == 2116800 ? "24.5 days" :
+    "8 days"
+  )
 }
 
 # ── Guard: detect a prior deploy.sh deployment ────────────────────────────────
@@ -319,20 +339,22 @@ resource "google_logging_metric" "sync_success" {
   depends_on = [google_project_service.nonprod_apis]
 }
 
-# Alert policy: fire if no successful sync in the last 25 hours.
-# Catches cases where the job silently stops running (scheduler issue,
-# job deleted, etc.) rather than failing loudly.
+# Alert policy: fire if no successful sync within one schedule cadence
+# (plus slack). Catches the job silently stopping (scheduler issue, job
+# deleted) rather than failing loudly. Skipped entirely for on-demand —
+# there is no expected cadence to be absent from.
 resource "google_monitoring_alert_policy" "sync_missing" {
-  display_name = "${var.job_name} sync not run in 25h"
+  count        = local.create_scheduler ? 1 : 0
+  display_name = "${var.job_name} sync overdue"
   project      = var.nonprod_project_id
   combiner     = "OR"
 
   conditions {
-    display_name = "No successful sync in last 25 hours"
+    display_name = "No successful sync in last ${local.absence_label}"
 
     condition_absent {
       filter   = "metric.type=\"logging.googleapis.com/user/${google_logging_metric.sync_success.name}\" AND resource.type=\"cloud_run_job\""
-      duration = "90000s" # 25 hours — covers nightly schedule with 1h tolerance
+      duration = "${local.absence_seconds}s" # derived from schedule cadence
 
       aggregations {
         alignment_period   = "3600s"
@@ -344,7 +366,7 @@ resource "google_monitoring_alert_policy" "sync_missing" {
   notification_channels = [google_monitoring_notification_channel.email.name]
 
   documentation {
-    content   = "The CloudSQL sync job **${var.job_name}** has not completed successfully in the last 25 hours. Check the scheduler and recent executions: https://console.cloud.google.com/run/jobs?project=${var.nonprod_project_id}"
+    content   = "The CloudSQL sync job **${var.job_name}** has not completed successfully in the last ${local.absence_label} (schedule: `${var.schedule}`). Check the scheduler and recent executions: https://console.cloud.google.com/run/jobs?project=${var.nonprod_project_id}"
     mime_type = "text/markdown"
   }
 

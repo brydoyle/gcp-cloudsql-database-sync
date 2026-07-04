@@ -1,7 +1,7 @@
 # Runbook — CloudSQL Cross-Project Sync
 
 **Service:** `cloudsql-sync` Cloud Run Job  
-**Schedule:** Nightly at 02:00 UTC (configurable)  
+**Schedule:** Configurable via `configure.py` — default weekly, Saturday 23:00. `on-demand` deployments have **no scheduler at all** (scheduler commands below don't apply; trigger manually).  
 **Audience:** On-call engineers
 
 ---
@@ -23,11 +23,11 @@ watch -n 10 "gcloud logging read \
 gcloud run jobs executions list \
   --job=cloudsql-sync --region=us-central1 --project=NONPROD_PROJECT --limit=5
 
-# Pause nightly schedule
+# Pause the schedule (skip if deployed on-demand — no scheduler exists)
 gcloud scheduler jobs pause cloudsql-sync-nightly \
   --location=us-central1 --project=NONPROD_PROJECT
 
-# Resume nightly schedule
+# Resume the schedule
 gcloud scheduler jobs resume cloudsql-sync-nightly \
   --location=us-central1 --project=NONPROD_PROJECT
 
@@ -48,7 +48,7 @@ gcloud sql backups delete BACKUP_ID \
 |---|---|---|
 | `0` | Success | — |
 | `1` | Config error (bad env vars, no credentials) | §1 |
-| `2` | Cloud SQL API error | §2 |
+| `2` | Cloud SQL API error | §2 (or §7 if "No successful backup found") |
 | `3` | Operation timed out | §3 |
 | `4` | Unexpected error (missing API field, unhandled exception) | Check logs |
 
@@ -233,11 +233,38 @@ Note: a running execution **cannot be stopped** — it will run to completion. N
 
 **Update the schedule:**
 ```bash
-# Edit sync_job/config.yaml: schedule: "0 3 * * *"
-bash sync_job/deploy.sh
+# Re-run the wizard (interactive picker: weekly/daily/weekdays/on-demand/cron)
+cd sync_job && python3 configure.py && bash deploy.sh
 # or
 terraform apply
 ```
+
+---
+
+### §7 — "No successful backup found" (reuse-existing-backup mode)
+
+**Symptoms:** exit code 2 with `No successful backup found for PROD_PROJECT/PROD_INSTANCE`.
+
+**Cause:** the job is configured with `USE_LATEST_EXISTING_BACKUP=true`, but the prod instance has no `SUCCESSFUL` backup to reuse. The job deliberately does **not** fall back to creating one.
+
+**Check what backups exist:**
+```bash
+gcloud sql backups list --instance=PROD_INSTANCE --project=PROD_PROJECT \
+  --format="table(id,status,type,startTime,endTime)"
+```
+
+**Fix — either:**
+- Create a backup, then re-run the sync:
+  ```bash
+  gcloud sql backups create --instance=PROD_INSTANCE --project=PROD_PROJECT
+  ```
+- Or enable automated backups on prod so one always exists, or switch the job back to create-per-run:
+  ```bash
+  gcloud run jobs update cloudsql-sync --region=us-central1 --project=NONPROD_PROJECT \
+    --update-env-vars=USE_LATEST_EXISTING_BACKUP=false
+  ```
+
+Related: in reuse mode the job never deletes the backup it restored from — a lingering backup after a run is expected, not an orphan (see §4 for genuinely orphaned `ON_DEMAND` backups from create-per-run mode).
 
 ---
 

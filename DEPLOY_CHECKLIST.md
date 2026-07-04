@@ -85,13 +85,13 @@ terraform apply
   ```
   Last line should be: `Sync finished successfully.`
 
-- [ ] **No orphaned backups** left on prod:
+- [ ] **No orphaned backups** left on prod (skip if `use_latest_existing_backup: true` — the reused backup is *supposed* to remain):
   ```bash
   gcloud sql backups list --instance=PROD_INSTANCE --project=PROD_PROJECT \
     --filter="type=ON_DEMAND"
   ```
 
-- [ ] **Scheduler confirmed** for next run:
+- [ ] **Scheduler confirmed** for next run (skip if schedule is `on-demand` — no scheduler exists by design):
   ```bash
   gcloud scheduler jobs describe cloudsql-sync-nightly \
     --location=us-central1 --project=NONPROD_PROJECT \
