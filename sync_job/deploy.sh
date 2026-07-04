@@ -2,6 +2,12 @@
 # Deploy the CloudSQL snapshot sync job to Cloud Run Jobs + Cloud Scheduler.
 # Run from the sync_job/ directory. Safe to re-run (idempotent).
 #
+# ⚠ This is the QUICKSTART/POC deploy path. For production, use terraform/
+#   (state, drift detection, least-privilege IAM, PR-reviewed changes) — see
+#   README "Choosing a deploy path". The two paths manage the same resources
+#   and are mutually exclusive; this script refuses to touch a
+#   Terraform-managed job, and Terraform refuses to touch a deploy.sh one.
+#
 # Prerequisites:
 #   - gcloud CLI authenticated with sufficient IAM in both projects
 #   - config.yaml present (run: python3 configure.py)
@@ -50,7 +56,8 @@ if missing:
 
 # Output required keys, then optional keys (may be empty)
 for k in required + ['alert_email', 'use_latest_existing_backup',
-                     'vpc_connector', 'vpc_network', 'vpc_subnetwork', 'vpc_egress']:
+                     'vpc_connector', 'vpc_network', 'vpc_subnetwork', 'vpc_egress',
+                     'verify_restore']:
     print(cfg.get(k, ''))
 ") || { log "ERROR: Failed to load config.yaml — run 'python3 configure.py' first."; exit 1; }
 
@@ -69,9 +76,11 @@ VPC_CONNECTOR=$(   sed -n '11p' <<< "${_raw_config}")
 VPC_NETWORK=$(     sed -n '12p' <<< "${_raw_config}")
 VPC_SUBNETWORK=$(  sed -n '13p' <<< "${_raw_config}")
 VPC_EGRESS=$(      sed -n '14p' <<< "${_raw_config}")
+VERIFY_RESTORE=$(  sed -n '15p' <<< "${_raw_config}")
 # Defaults when unset/blank
 USE_LATEST_BACKUP="${USE_LATEST_BACKUP:-false}"
 VPC_EGRESS="${VPC_EGRESS:-private-ranges-only}"
+VERIFY_RESTORE="${VERIFY_RESTORE:-true}"
 
 # Optional private networking for the Cloud Run Job. Blank = public egress
 # (works in any environment with no VPC prerequisites).
@@ -100,6 +109,22 @@ fi
 IMAGE="gcr.io/${NONPROD_PROJECT}/${JOB_NAME}"
 JOB_SA="${JOB_NAME}@${NONPROD_PROJECT}.iam.gserviceaccount.com"
 SCHEDULER_SA="${JOB_NAME}-scheduler@${NONPROD_PROJECT}.iam.gserviceaccount.com"
+
+# ── Guard: never overwrite a Terraform-managed job ───────────────────────────
+# deploy.sh labels its job managed-by=deploy-sh. If the job exists WITHOUT
+# that label, it belongs to Terraform (or something else) — refuse, mirroring
+# Terraform's check "no_bash_deploy" in the other direction.
+if EXISTING_OWNER=$(gcloud run jobs describe "${JOB_NAME}" \
+    --region="${RUN_REGION}" --project="${NONPROD_PROJECT}" \
+    --format="value(metadata.labels.managed-by)" 2>/dev/null); then
+  if [ "${EXISTING_OWNER}" != "deploy-sh" ]; then
+    log "ERROR: Cloud Run job '${JOB_NAME}' exists but is NOT managed by deploy.sh"
+    log "  (label managed-by='${EXISTING_OWNER:-<none>}'). It is likely Terraform-managed."
+    log "  Use 'terraform apply' for this project, or delete the job first if you"
+    log "  intend to hand ownership back to deploy.sh. See README 'Choosing a deploy path'."
+    exit 1
+  fi
+fi
 
 log "Loaded config:"
 log "  Prod:    ${PROD_PROJECT} / ${PROD_INSTANCE}"
@@ -172,7 +197,8 @@ NONPROD_PROJECT_ID=${NONPROD_PROJECT},\
 NONPROD_INSTANCE_NAME=${NONPROD_INSTANCE},\
 GCP_REGION=${RUN_REGION},\
 USE_LATEST_EXISTING_BACKUP=${USE_LATEST_BACKUP},\
-SYNC_NETWORK_MODE=${SYNC_NET}" \
+SYNC_NETWORK_MODE=${SYNC_NET},\
+VERIFY_RESTORE=${VERIFY_RESTORE}" \
   ${VPC_ARGS[@]+"${VPC_ARGS[@]}"} \
   --project="${NONPROD_PROJECT}"
 

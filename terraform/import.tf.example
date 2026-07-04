@@ -1,0 +1,60 @@
+# ---------------------------------------------------------------------------
+# OPTIONAL EXAMPLE — adopt an existing deploy.sh deployment into Terraform.
+#
+# Use this ONCE when graduating a bash-deployed environment to Terraform
+# ownership (see README → "Choosing a deploy path"). Terraform >= 1.5 import
+# blocks make the migration a plan/apply instead of a dozen CLI commands.
+#
+# Steps:
+#   1. Copy to import.tf and replace CTRL / PROD / REGION / JOB placeholders
+#      (JOB = your job_name, default cloudsql-sync).
+#   2. terraform plan   — every imported resource should show "import", and
+#      the remaining diff should be small (e.g. the managed-by label being
+#      removed, which is exactly what releases the deploy.sh guard).
+#   3. terraform apply
+#   4. Delete import.tf (import blocks are one-shot) and stop using deploy.sh
+#      for this project.
+#
+# NOTE with least_privilege=true (the default), the custom roles don't exist
+# yet in a bash-deployed project — Terraform will CREATE those and REMOVE the
+# job SA's roles/cloudsql.admin bindings. That's the intended tightening.
+# Monitoring policies/metrics/channel from deploy.sh are intentionally not
+# imported — names differ per-config; let Terraform create its own (delete
+# the bash-created ones afterward in the console or via gcloud).
+# ---------------------------------------------------------------------------
+
+import {
+  to = google_service_account.job
+  id = "projects/CTRL/serviceAccounts/JOB@CTRL.iam.gserviceaccount.com"
+}
+
+import {
+  to = google_cloud_run_v2_job.sync
+  id = "projects/CTRL/locations/REGION/jobs/JOB"
+}
+
+# Skip these two if the environment was deployed with schedule: on-demand.
+import {
+  to = google_service_account.scheduler[0]
+  id = "projects/CTRL/serviceAccounts/JOB-scheduler@CTRL.iam.gserviceaccount.com"
+}
+
+import {
+  to = google_cloud_scheduler_job.nightly[0]
+  id = "projects/CTRL/locations/REGION/jobs/JOB-nightly"
+}
+
+import {
+  to = google_secret_manager_secret.nonprod_db_password
+  id = "projects/CTRL/secrets/JOB-nonprod-db-password"
+}
+
+import {
+  to = google_secret_manager_secret_iam_member.job_secret_accessor
+  id = "projects/CTRL/secrets/JOB-nonprod-db-password roles/secretmanager.secretAccessor serviceAccount:JOB@CTRL.iam.gserviceaccount.com"
+}
+
+import {
+  to = google_project_iam_member.scheduler_run_invoker[0]
+  id = "CTRL roles/run.invoker serviceAccount:JOB-scheduler@CTRL.iam.gserviceaccount.com"
+}

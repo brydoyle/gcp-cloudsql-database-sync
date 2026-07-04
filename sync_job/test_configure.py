@@ -742,3 +742,54 @@ class TestVpcFields:
         assert 'vpc_network = "corp-vpc"' in content
         assert 'vpc_subnetwork = "corp-subnet"' in content
         assert 'vpc_egress = "ALL_TRAFFIC"' in content
+
+
+# ---------------------------------------------------------------------------
+# verify_restore field
+# ---------------------------------------------------------------------------
+
+class TestVerifyRestoreField:
+
+    def test_defaults_true(self):
+        assert field("verify_restore")["default"] == "true"
+
+    @pytest.mark.parametrize("value", ["true", "false", "TRUE"])
+    def test_validator_accepts_bools(self, value):
+        assert field("verify_restore")["validate"](value) is None
+
+    @pytest.mark.parametrize("value", ["yes", "1", ""])
+    def test_validator_rejects_non_bools(self, value):
+        assert field("verify_restore")["validate"](value) is not None
+
+    def test_tfvars_emits_true_by_default(self):
+        cfg = {
+            "prod_project_id": "my-prod", "prod_instance_name": "prod-db",
+            "nonprod_project_id": "my-nonprod", "nonprod_instance_name": "nonprod-db",
+            "region": "us-central1", "job_name": "cloudsql-sync",
+            "schedule": "0 23 * * 6", "timezone": "UTC",
+        }
+        with tempfile.NamedTemporaryFile(suffix=".tfvars", delete=False) as f:
+            path = f.name
+        try:
+            _write_tfvars(path, cfg)
+            content = open(path).read()
+            assert "verify_restore             = true" in content
+        finally:
+            os.unlink(path)
+
+    def test_tfvars_emits_false_when_disabled(self):
+        cfg = {
+            "prod_project_id": "my-prod", "prod_instance_name": "prod-db",
+            "nonprod_project_id": "my-nonprod", "nonprod_instance_name": "nonprod-db",
+            "region": "us-central1", "job_name": "cloudsql-sync",
+            "schedule": "0 23 * * 6", "timezone": "UTC",
+            "verify_restore": "false",
+        }
+        with tempfile.NamedTemporaryFile(suffix=".tfvars", delete=False) as f:
+            path = f.name
+        try:
+            _write_tfvars(path, cfg)
+            content = open(path).read()
+            assert "verify_restore             = false" in content
+        finally:
+            os.unlink(path)

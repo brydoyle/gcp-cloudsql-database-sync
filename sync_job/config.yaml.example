@@ -27,6 +27,10 @@ job_name: cloudsql-sync
 # by the job. Default false (create a fresh on-demand backup every run).
 use_latest_existing_backup: "false"
 
+# Verify each target after restore: instance must be RUNNABLE, and (when the
+# Secret Manager password reset is enabled) a live SQL SELECT 1 must succeed.
+verify_restore: "true"
+
 # ── Optional private networking for the Cloud Run Job ────────────────────────
 # Leave all blank for public egress (works anywhere, but the job will WARN at
 # deploy time and at runtime). Set EITHER a Serverless VPC Access connector OR

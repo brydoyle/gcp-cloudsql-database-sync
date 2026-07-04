@@ -114,6 +114,18 @@ variable "use_latest_existing_backup" {
   default     = false
 }
 
+variable "verify_restore" {
+  description = "If true (default), the job verifies each target after restore: instance state must be RUNNABLE, and — when the Secret Manager password reset is enabled — a live SQL connection with SELECT 1 must succeed."
+  type        = bool
+  default     = true
+}
+
+variable "least_privilege" {
+  description = "If true (default), grant the job SA narrow custom roles (backup ops on prod; restore/connect/user-update on targets) instead of roles/cloudsql.admin. Set false to fall back to cloudsql.admin if a restore is denied a permission the custom roles miss."
+  type        = bool
+  default     = true
+}
+
 # ── Networking (all optional — defaults to public egress, works anywhere) ─────
 #
 # Two mutually exclusive private-networking modes for the Cloud Run Job:
