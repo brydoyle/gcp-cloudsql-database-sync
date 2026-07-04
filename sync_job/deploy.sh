@@ -118,11 +118,18 @@ if EXISTING_OWNER=$(gcloud run jobs describe "${JOB_NAME}" \
     --region="${RUN_REGION}" --project="${NONPROD_PROJECT}" \
     --format="value(metadata.labels.managed-by)" 2>/dev/null); then
   if [ "${EXISTING_OWNER}" != "deploy-sh" ]; then
-    log "ERROR: Cloud Run job '${JOB_NAME}' exists but is NOT managed by deploy.sh"
-    log "  (label managed-by='${EXISTING_OWNER:-<none>}'). It is likely Terraform-managed."
-    log "  Use 'terraform apply' for this project, or delete the job first if you"
-    log "  intend to hand ownership back to deploy.sh. See README 'Choosing a deploy path'."
-    exit 1
+    if [ "${DEPLOY_SH_ADOPT:-}" = "1" ]; then
+      log "DEPLOY_SH_ADOPT=1 — adopting existing job '${JOB_NAME}' into deploy.sh"
+      log "  ownership (it will be labelled managed-by=deploy-sh)."
+    else
+      log "ERROR: Cloud Run job '${JOB_NAME}' exists but is NOT labelled managed-by=deploy-sh"
+      log "  (label managed-by='${EXISTING_OWNER:-<none>}')."
+      log "  If it is Terraform-managed: use 'terraform apply' instead."
+      log "  If it was created by an OLDER deploy.sh (before labelling existed):"
+      log "    DEPLOY_SH_ADOPT=1 bash deploy.sh   # one-time adoption, stamps the label"
+      log "  See README 'Choosing a deploy path'."
+      exit 1
+    fi
   fi
 fi
 
@@ -280,7 +287,7 @@ if [[ -n "${ALERT_EMAIL}" ]]; then
   # Redirect stderr to /dev/null to prevent gcloud self-update noise from
   # contaminating the captured output.
   CHANNEL_NAME=$(gcloud beta monitoring channels list \
-    --filter="displayName='CloudSQL Sync Alerts'" \
+    --filter='display_name="CloudSQL Sync Alerts"' \
     --format="value(name)" \
     --project="${NONPROD_PROJECT}" 2>/dev/null | head -1)
 
@@ -298,7 +305,7 @@ if [[ -n "${ALERT_EMAIL}" ]]; then
 
   log "Creating failure alert policy..."
   POLICY_EXISTS=$(gcloud alpha monitoring policies list \
-    --filter="displayName='${JOB_NAME} sync failed'" \
+    --filter="display_name=\"${JOB_NAME} sync failed\"" \
     --format="value(name)" \
     --project="${NONPROD_PROJECT}" 2>/dev/null | head -1)
 
@@ -320,7 +327,6 @@ if [[ -n "${ALERT_EMAIL}" ]]; then
       "aggregations": [{"alignmentPeriod": "60s", "perSeriesAligner": "ALIGN_COUNT"}]
     }
   }],
-  "alertStrategy": { "notificationRateLimit": { "period": "3600s" } },
   "combiner": "OR",
   "notificationChannels": ["${CHANNEL_NAME}"]
 }
@@ -350,7 +356,7 @@ EOF
   # doesn't page daily. Skipped entirely for on-demand: no cadence to miss.
   # Remove the legacy fixed-25h policy from older deploys if present.
   STALE_POLICY=$(gcloud alpha monitoring policies list \
-    --filter="displayName='${JOB_NAME} sync not run in 25h'" \
+    --filter="display_name=\"${JOB_NAME} sync not run in 25h\"" \
     --format="value(name)" \
     --project="${NONPROD_PROJECT}" 2>/dev/null | head -1)
   if [[ -n "${STALE_POLICY}" ]]; then
@@ -359,24 +365,22 @@ EOF
       && log "Removed legacy fixed-25h absence policy." || true
   fi
 
+  # Cloud Monitoring HARD LIMIT (verified live): alerting conditions can only
+  # look back 24h — condition_absent caps at 23h30m and MQL at 24h. So an
+  # "overdue" alert is only expressible for daily-or-finer cadences; for
+  # weekly/monthly, rely on the failure alert.
+  CRON_DOM=$(echo "${SCHEDULE}" | awk '{print $3}')
+  CRON_DOW=$(echo "${SCHEDULE}" | awk '{print $5}')
   if [ "${SCHEDULE}" = "on-demand" ]; then
     log "Schedule is on-demand — skipping the absence alert (no cadence to miss)."
+  elif [ "${CRON_DOW}" != "*" ] || [ "${CRON_DOM}" != "*" ]; then
+    log "Schedule cadence exceeds Cloud Monitoring's 24h alerting lookback —"
+    log "  skipping the overdue alert (platform limit); the failure alert still covers errors."
   else
-    # Derive the window from the cron's day-of-month / day-of-week fields.
-    CRON_DOM=$(echo "${SCHEDULE}" | awk '{print $3}')
-    CRON_DOW=$(echo "${SCHEDULE}" | awk '{print $5}')
-    if [ "${CRON_DOW}" = "*" ] && [ "${CRON_DOM}" = "*" ]; then
-      ABSENCE_SECONDS=90000;   ABSENCE_LABEL="25 hours"    # daily or finer
-    elif [ "${CRON_DOW}" = "1-5" ]; then
-      ABSENCE_SECONDS=262800;  ABSENCE_LABEL="73 hours"    # weekdays (weekend gap)
-    elif [ "${CRON_DOM}" != "*" ]; then
-      ABSENCE_SECONDS=2116800; ABSENCE_LABEL="24.5 days"   # monthly (API max)
-    else
-      ABSENCE_SECONDS=691200;  ABSENCE_LABEL="8 days"      # weekly
-    fi
+    ABSENCE_SECONDS=84600; ABSENCE_LABEL="23.5 hours"   # API max for condition_absent
 
     ABSENCE_POLICY_EXISTS=$(gcloud alpha monitoring policies list \
-      --filter="displayName='${JOB_NAME} sync overdue'" \
+      --filter="display_name=\"${JOB_NAME} sync overdue\"" \
       --format="value(name)" \
       --project="${NONPROD_PROJECT}" 2>/dev/null | head -1)
 

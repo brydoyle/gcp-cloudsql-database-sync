@@ -39,25 +39,19 @@ locals {
   # Private networking is opt-in: connector OR direct VPC egress. Blank = public.
   use_vpc = var.vpc_connector != "" || var.vpc_network != ""
 
-  # Absence-alert window derived from the schedule cadence (plus slack for a
-  # slow run), so a weekly schedule doesn't page daily. Cloud Monitoring caps
-  # absence durations at 24.5 days. No absence alert at all when on-demand.
+  # Overdue ("absence") alert: Cloud Monitoring alerting can only look back
+  # 24h (condition_absent caps at 23h30m; MQL at 24h — verified against the
+  # live API). So the alert is only expressible for daily-or-finer cadences;
+  # for weekly/monthly cadences it is skipped and the failure alert is the
+  # safety net. No absence alert when on-demand either.
   sched_fields = split(" ", trimspace(var.schedule))
   sched_dom    = length(local.sched_fields) == 5 ? local.sched_fields[2] : "*"
   sched_dow    = length(local.sched_fields) == 5 ? local.sched_fields[4] : "*"
 
-  absence_seconds = (
-    local.sched_dow == "*" && local.sched_dom == "*" ? 90000 : # daily/finer: 25h
-    local.sched_dow == "1-5" ? 262800 :                        # weekdays: 73h (weekend gap)
-    local.sched_dom != "*" ? 2116800 :                         # monthly: 24.5d (API max)
-    691200                                                     # weekly: 8 days
-  )
-  absence_label = (
-    local.absence_seconds == 90000 ? "25 hours" :
-    local.absence_seconds == 262800 ? "73 hours" :
-    local.absence_seconds == 2116800 ? "24.5 days" :
-    "8 days"
-  )
+  daily_or_finer  = local.sched_dow == "*" && local.sched_dom == "*"
+  create_overdue  = local.create_scheduler && local.daily_or_finer
+  absence_seconds = 84600 # 23h30m — the condition_absent maximum
+  absence_label   = "23.5 hours"
 }
 
 # ── Guard: detect a prior deploy.sh deployment ────────────────────────────────
@@ -412,13 +406,9 @@ resource "google_monitoring_alert_policy" "sync_failure" {
     }
   }
 
+  # NOTE: notification_rate_limit is only permitted on log-based alert
+  # policies; this is a metric-threshold policy, so no alert_strategy here.
   notification_channels = [google_monitoring_notification_channel.email.name]
-
-  alert_strategy {
-    notification_rate_limit {
-      period = "3600s" # at most one alert per hour
-    }
-  }
 
   documentation {
     content   = "The CloudSQL sync job **${var.job_name}** failed. Check logs: https://console.cloud.google.com/run/jobs/executions?project=${var.nonprod_project_id}"
@@ -454,7 +444,7 @@ resource "google_logging_metric" "sync_success" {
 # deleted) rather than failing loudly. Skipped entirely for on-demand —
 # there is no expected cadence to be absent from.
 resource "google_monitoring_alert_policy" "sync_missing" {
-  count        = local.create_scheduler ? 1 : 0
+  count        = local.create_overdue ? 1 : 0
   display_name = "${var.job_name} sync overdue"
   project      = var.nonprod_project_id
   combiner     = "OR"

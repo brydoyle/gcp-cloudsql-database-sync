@@ -200,6 +200,8 @@ The contested resources are cheap and stateless, so you have two safe options:
 
 The guard is now **symmetric**: Terraform refuses to touch a `deploy.sh`-labelled job, and `deploy.sh` refuses to touch a job without that label.
 
+> **Upgrading from an older deploy.sh** (before labelling existed)? Your live job has no label, so the guard blocks it. Run `DEPLOY_SH_ADOPT=1 bash deploy.sh` once — it adopts the job and stamps the label; subsequent runs need no flag.
+
 ### Remote Terraform state
 
 Local state is fine solo; for a team or CI, use the GCS backend: copy [`terraform/backend.tf.example`](terraform/backend.tf.example) to `backend.tf` (it includes the one-time bucket bootstrap commands) and run `terraform init -migrate-state`.
@@ -296,7 +298,8 @@ When `alert_email` is set, `deploy.sh` / Terraform creates:
 
 1. A **log-based metric** counting executions where the container exits with a non-zero code
 2. An **email notification channel**
-3. An **alert policy** that fires immediately on first failure, rate-limited to once per hour
+3. A **failure alert** that fires immediately on any failed execution
+4. An **overdue alert** (no success in 23.5h) — created **only for daily-or-finer schedules**: Cloud Monitoring alerting cannot look back more than 24h (hard platform limit), so weekly/monthly cadences rely on the failure alert instead
 
 ---
 
