@@ -984,6 +984,7 @@ class TestPublicNetworkWarning:
              patch("main.build_sqladmin", return_value=MagicMock()), \
              patch("main.acquire_backup", return_value=(1, True)), \
              patch("main.restore_to_target"), \
+             patch("main.verify_target"), \
              patch("main.delete_backup"):
             with caplog.at_level(logging.WARNING):
                 main.main()
@@ -1003,3 +1004,84 @@ class TestPublicNetworkWarning:
     def test_private_is_case_insensitive(self, caplog):
         assert self.WARNING_FRAGMENT not in self._run_main(
             {"SYNC_NETWORK_MODE": " Private "}, caplog)
+
+
+# ---------------------------------------------------------------------------
+# verify_target — post-restore verification
+# ---------------------------------------------------------------------------
+
+class TestVerifyTarget:
+
+    def _service(self, state="RUNNABLE", connection_name="p:r:i"):
+        svc = MagicMock()
+        svc.instances.return_value.get.return_value.execute.return_value = {
+            "state": state,
+            "connectionName": connection_name,
+        }
+        return svc
+
+    def test_api_only_when_no_password(self):
+        """Without a password, only the API-level RUNNABLE check runs."""
+        svc = self._service()
+        with patch("main._verify_sql") as sql:
+            main.verify_target(svc, FAST_TARGET, FAST_CFG, password=None)
+        sql.assert_not_called()
+
+    def test_not_runnable_raises(self):
+        svc = self._service(state="MAINTENANCE")
+        with pytest.raises(SyncError) as exc_info:
+            main.verify_target(svc, FAST_TARGET, FAST_CFG, password=None)
+        assert "MAINTENANCE" in str(exc_info.value)
+
+    def test_sql_check_runs_with_password(self):
+        svc = self._service(connection_name="proj:region:inst")
+        with patch("main._verify_sql") as sql:
+            main.verify_target(svc, FAST_TARGET, FAST_CFG, password="pw")
+        sql.assert_called_once_with("proj:region:inst", "pw")
+
+    def test_sql_failure_raises_sync_error(self):
+        svc = self._service()
+        with patch("main._verify_sql", side_effect=RuntimeError("connection refused")):
+            with pytest.raises(SyncError) as exc_info:
+                main.verify_target(svc, FAST_TARGET, FAST_CFG, password="pw")
+        assert "connection refused" in str(exc_info.value)
+
+    def test_missing_connection_name_falls_back_to_region(self):
+        svc = MagicMock()
+        svc.instances.return_value.get.return_value.execute.return_value = {
+            "state": "RUNNABLE",
+        }
+        with patch("main._verify_sql") as sql:
+            main.verify_target(svc, FAST_TARGET, FAST_CFG, password="pw")
+        expected = f"{FAST_TARGET.project}:{FAST_CFG.region}:{FAST_TARGET.instance}"
+        sql.assert_called_once_with(expected, "pw")
+
+    def test_api_error_raises_sync_error(self):
+        svc = MagicMock()
+        svc.instances.return_value.get.return_value.execute.side_effect = make_http_error(403)
+        with pytest.raises(SyncError):
+            main.verify_target(svc, FAST_TARGET, FAST_CFG, password=None)
+
+
+class TestVerifyWiredIntoMain:
+
+    def _run(self, extra_env):
+        env = {**VALID_ENV, **extra_env}
+        calls = {}
+        with patch.dict("os.environ", env, clear=True), \
+             patch("main.build_sqladmin", return_value=MagicMock()), \
+             patch("main.acquire_backup", return_value=(1, True)), \
+             patch("main.restore_to_target"), \
+             patch("main.delete_backup"), \
+             patch("main.verify_target") as verify:
+            main.main()
+            calls["verify"] = verify
+        return calls["verify"]
+
+    def test_verification_on_by_default(self):
+        verify = self._run({})
+        verify.assert_called_once()
+
+    def test_verification_can_be_disabled(self):
+        verify = self._run({"VERIFY_RESTORE": "false"})
+        verify.assert_not_called()

@@ -1,0 +1,30 @@
+# ---------------------------------------------------------------------------
+# OPTIONAL EXAMPLE — remote Terraform state in GCS.
+#
+# Local state (the default) is fine for a single-person POC. The moment a
+# second person or a CI pipeline touches this module, use remote state:
+# versioned, locked, and not trapped on someone's laptop.
+#
+# 1. Create the state bucket ONCE (versioning on, so state history is kept):
+#
+#      gcloud storage buckets create gs://YOUR_STATE_BUCKET \
+#        --project=YOUR_CONTROL_PROJECT --location=us-central1 \
+#        --uniform-bucket-level-access
+#      gcloud storage buckets update gs://YOUR_STATE_BUCKET --versioning
+#
+# 2. Copy this file to backend.tf, fill in the bucket, then migrate:
+#
+#      terraform init -migrate-state
+#
+# Notes:
+#   - GCS backend does native state locking — no extra lock table needed.
+#   - CI's `terraform init -backend=false` is unaffected by this block.
+#   - Anyone running apply needs roles/storage.objectAdmin on the bucket.
+# ---------------------------------------------------------------------------
+
+terraform {
+  backend "gcs" {
+    bucket = "YOUR_STATE_BUCKET"
+    prefix = "cloudsql-sync"
+  }
+}

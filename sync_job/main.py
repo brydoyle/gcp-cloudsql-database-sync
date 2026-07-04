@@ -513,6 +513,73 @@ def restore_to_target(service, backup_id: int, target: Target, cfg: Config) -> N
     log.info("Restore to %s complete.", target)
 
 
+def _verify_sql(connection_name: str, password: str) -> None:
+    """Connect to the instance via the Cloud SQL Python Connector and run
+    SELECT 1. Proves the engine is up, accepting connections, and that the
+    postgres password (reset from Secret Manager) actually works."""
+    # Lazy import: the connector is only needed when SQL verification runs,
+    # and unit tests patch this function entirely.
+    from google.cloud.sql.connector import Connector
+
+    with Connector() as connector:
+        conn = connector.connect(
+            connection_name, "pg8000",
+            user="postgres", password=password, db="postgres",
+        )
+        try:
+            cur = conn.cursor()
+            cur.execute("SELECT 1")
+            row = cur.fetchone()
+            if not row or row[0] != 1:
+                raise RuntimeError(f"unexpected SELECT 1 result: {row!r}")
+        finally:
+            conn.close()
+
+
+def verify_target(service, target: Target, cfg: Config, password=None) -> None:
+    """Post-restore verification for one target.
+
+    Tier 1 (always): instances.get → state must be RUNNABLE. No credentials
+    needed beyond the job SA's existing API access.
+    Tier 2 (when a password is available, i.e. Secret Manager reset is on):
+    open a real SQL connection and SELECT 1 — turns "the API said DONE" into
+    "the database actually serves queries with the expected credential".
+    """
+    log.info("Verifying restore on %s ...", target)
+    try:
+        inst = (
+            service.instances()
+            .get(project=target.project, instance=target.instance)
+            .execute(num_retries=3)
+        )
+    except HttpError as exc:
+        _raise_for_http_error(exc, f"verifying {target}")
+
+    state = inst.get("state")
+    if state != "RUNNABLE":
+        raise SyncError(
+            f"Post-restore verification failed: {target} state is {state!r}, "
+            "expected RUNNABLE"
+        )
+
+    if password is None:
+        log.info(
+            "Verification (API-level) passed: %s is RUNNABLE. SQL check "
+            "skipped — no password configured (enable the Secret Manager "
+            "password reset for full verification).", target,
+        )
+        return
+
+    conn_name = inst.get("connectionName") or f"{target.project}:{cfg.region}:{target.instance}"
+    try:
+        _verify_sql(conn_name, password)
+    except Exception as exc:  # noqa: BLE001
+        raise SyncError(
+            f"Post-restore SQL verification failed on {target}: {exc}"
+        ) from exc
+    log.info("Verification passed: %s is RUNNABLE and serving SQL.", target)
+
+
 def delete_backup(service, backup_id: int, cfg: Config) -> None:
     """Delete the on-demand backup to avoid accumulating against quota.
 
@@ -644,6 +711,9 @@ def main() -> None:
                 f"Failed to read secret {password_secret}: {exc}"
             ) from exc
 
+    # Post-restore verification is on by default; VERIFY_RESTORE=false skips it.
+    verify_enabled = _bool_env("VERIFY_RESTORE", default=True)
+
     # Either create a fresh backup (owned, will be deleted) or reuse the latest
     # existing one (not owned, left in place).
     backup_id, backup_owned = acquire_backup(service, cfg)
@@ -658,6 +728,8 @@ def main() -> None:
                 restore_to_target(service, backup_id, target, cfg)
                 if password is not None:
                     reset_target_password(service, target, cfg, password)
+                if verify_enabled:
+                    verify_target(service, target, cfg, password)
             except SyncError as exc:
                 log.error("Target %s failed: %s", target, exc)
                 failures.append((target, exc))

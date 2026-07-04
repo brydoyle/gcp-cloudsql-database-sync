@@ -130,18 +130,78 @@ resource "google_service_account" "job" {
   depends_on = [google_project_service.nonprod_apis]
 }
 
-# Grant cloudsql.admin on the PROD project so the job can create/delete backups.
+# ── IAM: least-privilege custom roles (default) or cloudsql.admin fallback ────
+#
+# With least_privilege=true (default) the job SA gets exactly the permissions
+# the sync uses — nothing that could delete or reconfigure an instance:
+#   prod:   create/read/list/delete backup runs, read operations & instance
+#   target: restore, read instance, connect (SQL verification), update the
+#           postgres user (password reset), read operations
+# Role IDs are derived from job_name (custom role IDs allow only [a-zA-Z0-9_.]).
+
+locals {
+  role_id_base = replace(var.job_name, "-", "_")
+}
+
+resource "google_project_iam_custom_role" "prod_backup_ops" {
+  count       = var.least_privilege ? 1 : 0
+  provider    = google.prod
+  project     = var.prod_project_id
+  role_id     = "${local.role_id_base}_backup_ops"
+  title       = "CloudSQL Sync — prod backup operations"
+  description = "Create/read/list/delete backup runs and read operations for the ${var.job_name} job. No instance mutation."
+  permissions = [
+    "cloudsql.backupRuns.create",
+    "cloudsql.backupRuns.get",
+    "cloudsql.backupRuns.list",
+    "cloudsql.backupRuns.delete",
+    "cloudsql.operations.get",
+    "cloudsql.instances.get",
+  ]
+}
+
+resource "google_project_iam_member" "job_prod_backup_ops" {
+  count    = var.least_privilege ? 1 : 0
+  provider = google.prod
+  project  = var.prod_project_id
+  role     = google_project_iam_custom_role.prod_backup_ops[0].id
+  member   = "serviceAccount:${google_service_account.job.email}"
+}
+
+resource "google_project_iam_custom_role" "target_restore_ops" {
+  for_each    = var.least_privilege ? toset(local.target_projects) : toset([])
+  project     = each.value
+  role_id     = "${local.role_id_base}_restore_ops"
+  title       = "CloudSQL Sync — target restore operations"
+  description = "Restore, verify, and reset the postgres password on sync targets for the ${var.job_name} job."
+  permissions = [
+    "cloudsql.instances.restoreBackup",
+    "cloudsql.instances.get",
+    "cloudsql.instances.connect",
+    "cloudsql.users.update",
+    "cloudsql.users.list",
+    "cloudsql.operations.get",
+  ]
+}
+
+resource "google_project_iam_member" "job_target_restore_ops" {
+  for_each = var.least_privilege ? toset(local.target_projects) : toset([])
+  project  = each.value
+  role     = google_project_iam_custom_role.target_restore_ops[each.value].id
+  member   = "serviceAccount:${google_service_account.job.email}"
+}
+
+# Fallback: broad cloudsql.admin (pre-least-privilege behavior).
 resource "google_project_iam_member" "job_prod_cloudsql_admin" {
+  count    = var.least_privilege ? 0 : 1
   provider = google.prod
   project  = var.prod_project_id
   role     = "roles/cloudsql.admin"
   member   = "serviceAccount:${google_service_account.job.email}"
 }
 
-# Grant cloudsql.admin on each distinct target project so the job can trigger
-# restores there. With a single target this is just the control project.
 resource "google_project_iam_member" "job_target_cloudsql_admin" {
-  for_each = toset(local.target_projects)
+  for_each = var.least_privilege ? toset([]) : toset(local.target_projects)
   project  = each.value
   role     = "roles/cloudsql.admin"
   member   = "serviceAccount:${google_service_account.job.email}"
@@ -236,6 +296,10 @@ resource "google_cloud_run_v2_job" "sync" {
           name  = "SYNC_NETWORK_MODE"
           value = local.use_vpc ? "private" : "public"
         }
+        env {
+          name  = "VERIFY_RESTORE"
+          value = tostring(var.verify_restore)
+        }
         # Pass the secret RESOURCE NAME (not the value) — main.py fetches the
         # secret itself via the Secret Manager client using the job SA's
         # secretAccessor binding. This keeps both deploy paths consistent.
@@ -249,6 +313,8 @@ resource "google_cloud_run_v2_job" "sync" {
 
   depends_on = [
     google_project_service.nonprod_apis,
+    google_project_iam_member.job_prod_backup_ops,
+    google_project_iam_member.job_target_restore_ops,
     google_project_iam_member.job_prod_cloudsql_admin,
     google_project_iam_member.job_target_cloudsql_admin,
   ]

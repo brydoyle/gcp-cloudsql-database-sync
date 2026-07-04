@@ -202,6 +202,16 @@ FIELDS = [
             if v.lower() not in ("true", "false") else None
         ),
     },
+    {
+        "key":      "verify_restore",
+        "label":    "Verify each target after restore?",
+        "hint":     "true/false — API RUNNABLE check always; live SQL check when password reset is enabled (default: true)",
+        "default":  "true",
+        "validate": lambda v: (
+            "Must be 'true' or 'false'"
+            if v.lower() not in ("true", "false") else None
+        ),
+    },
     # ── Optional private networking for the Cloud Run Job ────────────────────
     # Leave all blank for public egress (works in any environment). Set EITHER
     # a Serverless VPC Access connector OR a network for Direct VPC egress.
@@ -296,8 +306,9 @@ def _write_tfvars(path: str, config: dict) -> None:
     email_line = (f'alert_email = "{alert_email}"'
                   if alert_email else
                   '# alert_email = "your-team@example.com"')
-    # Terraform expects an unquoted bool literal.
+    # Terraform expects unquoted bool literals.
     use_latest = str(cfg.get("use_latest_existing_backup", "false")).lower() == "true"
+    verify     = str(cfg.get("verify_restore", "true")).lower() != "false"
 
     # Optional networking → emit only what's set; map egress to the TF enum.
     vpc_lines = []
@@ -330,6 +341,7 @@ schedule   = "{cfg['schedule']}"
 timezone   = "{cfg['timezone']}"
 
 use_latest_existing_backup = {"true" if use_latest else "false"}
+verify_restore             = {"true" if verify else "false"}
 {vpc_block}
 # Build image first: gcloud builds submit sync_job/ --tag={image}
 container_image = "{image}"
