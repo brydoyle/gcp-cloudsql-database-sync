@@ -19,3 +19,10 @@ container_image = "gcr.io/your-nonprod-project-id/cloudsql-sync:latest"
 
 # Email to notify when the sync job fails
 alert_email = "your-team@example.com"
+
+# ── Optional private networking (blank/omitted = public egress + warnings) ────
+# Set EITHER vpc_connector OR vpc_network (+ vpc_subnetwork), not both.
+# vpc_connector = "projects/PROJECT/locations/REGION/connectors/NAME"
+# vpc_network    = "my-vpc"
+# vpc_subnetwork = "my-subnet"
+# vpc_egress     = "PRIVATE_RANGES_ONLY" # or "ALL_TRAFFIC" (needs Private Google Access)

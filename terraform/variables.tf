@@ -113,3 +113,39 @@ variable "use_latest_existing_backup" {
   type        = bool
   default     = false
 }
+
+# ── Networking (all optional — defaults to public egress, works anywhere) ─────
+#
+# Two mutually exclusive private-networking modes for the Cloud Run Job:
+#   1. Serverless VPC Access connector → set vpc_connector
+#   2. Direct VPC egress              → set vpc_network (+ vpc_subnetwork)
+# Leave all blank for public egress (no VPC prerequisites).
+
+variable "vpc_connector" {
+  description = "Optional Serverless VPC Access connector for the job's egress. Short name (same project/region) or full resource ID projects/PROJECT/locations/REGION/connectors/NAME. Mutually exclusive with vpc_network."
+  type        = string
+  default     = ""
+}
+
+variable "vpc_network" {
+  description = "Optional VPC network for Direct VPC egress (name or self-link). Mutually exclusive with vpc_connector."
+  type        = string
+  default     = ""
+}
+
+variable "vpc_subnetwork" {
+  description = "Optional subnetwork for Direct VPC egress. Only used with vpc_network; defaults to the network's subnet in the job's region."
+  type        = string
+  default     = ""
+}
+
+variable "vpc_egress" {
+  description = "Egress mode when VPC networking is configured: PRIVATE_RANGES_ONLY (default — Google API calls bypass the VPC) or ALL_TRAFFIC (everything through the VPC; the subnet then needs Private Google Access for the sqladmin/secretmanager API calls to work)."
+  type        = string
+  default     = "PRIVATE_RANGES_ONLY"
+
+  validation {
+    condition     = contains(["PRIVATE_RANGES_ONLY", "ALL_TRAFFIC"], var.vpc_egress)
+    error_message = "vpc_egress must be PRIVATE_RANGES_ONLY or ALL_TRAFFIC."
+  }
+}

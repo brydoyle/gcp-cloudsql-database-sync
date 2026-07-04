@@ -26,3 +26,12 @@ job_name: cloudsql-sync
 # creating a new one each run. When true, the reused backup is never deleted
 # by the job. Default false (create a fresh on-demand backup every run).
 use_latest_existing_backup: "false"
+
+# ── Optional private networking for the Cloud Run Job ────────────────────────
+# Leave all blank for public egress (works anywhere, but the job will WARN at
+# deploy time and at runtime). Set EITHER a Serverless VPC Access connector OR
+# a network for Direct VPC egress — not both.
+# vpc_connector: projects/PROJECT/locations/REGION/connectors/NAME
+# vpc_network: my-vpc
+# vpc_subnetwork: my-subnet
+# vpc_egress: private-ranges-only   # or all-traffic (subnet needs Private Google Access)

@@ -657,3 +657,88 @@ class TestPromptSchedule:
     def test_invalid_weekday_reprompts(self):
         with patch("builtins.input", side_effect=["1", "funday", "saturday", "23:00"]):
             assert _prompt_schedule(None, non_interactive=False) == "0 23 * * 6"
+
+
+# ---------------------------------------------------------------------------
+# VPC / networking fields
+# ---------------------------------------------------------------------------
+
+class TestVpcFields:
+
+    def _base_config(self, **overrides):
+        cfg = {
+            "prod_project_id": "my-prod",
+            "prod_instance_name": "prod-db",
+            "nonprod_project_id": "my-nonprod",
+            "nonprod_instance_name": "nonprod-db",
+            "region": "us-central1",
+            "job_name": "cloudsql-sync",
+            "schedule": "0 23 * * 6",
+            "timezone": "UTC",
+        }
+        cfg.update(overrides)
+        return cfg
+
+    def _tfvars(self, cfg) -> str:
+        with tempfile.NamedTemporaryFile(suffix=".tfvars", delete=False) as f:
+            path = f.name
+        try:
+            _write_tfvars(path, cfg)
+            with open(path) as fh:
+                return fh.read()
+        finally:
+            os.unlink(path)
+
+    # -- validators ----------------------------------------------------------
+
+    @pytest.mark.parametrize("value", ["private-ranges-only", "all-traffic", "ALL-TRAFFIC"])
+    def test_egress_validator_accepts(self, value):
+        assert field("vpc_egress")["validate"](value) is None
+
+    @pytest.mark.parametrize("value", ["everything", "PRIVATE_RANGES_ONLY", "public"])
+    def test_egress_validator_rejects(self, value):
+        assert field("vpc_egress")["validate"](value) is not None
+
+    def test_vpc_fields_are_optional(self):
+        for key in ("vpc_connector", "vpc_network", "vpc_subnetwork"):
+            assert field(key).get("optional") is True
+
+    # -- mutual exclusion ------------------------------------------------------
+
+    def test_connector_and_network_both_set_exits(self):
+        from configure import _check_vpc_exclusive
+        with pytest.raises(SystemExit) as exc_info:
+            _check_vpc_exclusive({"vpc_connector": "conn", "vpc_network": "net"})
+        assert exc_info.value.code == 1
+
+    def test_single_mode_passes(self):
+        from configure import _check_vpc_exclusive
+        _check_vpc_exclusive({"vpc_connector": "conn"})       # no raise
+        _check_vpc_exclusive({"vpc_network": "net"})          # no raise
+        _check_vpc_exclusive({})                              # no raise
+
+    # -- tfvars emission -------------------------------------------------------
+
+    def test_tfvars_public_by_default(self):
+        content = self._tfvars(self._base_config())
+        assert "vpc_connector" not in content.replace(
+            "# Public egress (no VPC). Set vpc_connector or vpc_network", "")
+        assert "Public egress (no VPC)" in content
+
+    def test_tfvars_emits_connector_and_upper_egress(self):
+        content = self._tfvars(self._base_config(
+            vpc_connector="projects/p/locations/r/connectors/c",
+            vpc_egress="private-ranges-only",
+        ))
+        assert 'vpc_connector = "projects/p/locations/r/connectors/c"' in content
+        assert 'vpc_egress = "PRIVATE_RANGES_ONLY"' in content
+
+    def test_tfvars_emits_network_subnet_all_traffic(self):
+        content = self._tfvars(self._base_config(
+            vpc_network="corp-vpc",
+            vpc_subnetwork="corp-subnet",
+            vpc_egress="all-traffic",
+        ))
+        assert 'vpc_network = "corp-vpc"' in content
+        assert 'vpc_subnetwork = "corp-subnet"' in content
+        assert 'vpc_egress = "ALL_TRAFFIC"' in content

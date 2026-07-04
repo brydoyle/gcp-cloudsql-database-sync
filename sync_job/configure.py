@@ -202,6 +202,40 @@ FIELDS = [
             if v.lower() not in ("true", "false") else None
         ),
     },
+    # ── Optional private networking for the Cloud Run Job ────────────────────
+    # Leave all blank for public egress (works in any environment). Set EITHER
+    # a Serverless VPC Access connector OR a network for Direct VPC egress.
+    {
+        "key":      "vpc_connector",
+        "label":    "VPC connector for the job (private networking)",
+        "hint":     "Leave blank for public egress. Mutually exclusive with vpc network.",
+        "optional": True,
+        "validate": lambda v: None,  # name or full resource ID — API validates
+    },
+    {
+        "key":      "vpc_network",
+        "label":    "VPC network for Direct VPC egress",
+        "hint":     "Leave blank for public egress. Mutually exclusive with vpc connector.",
+        "optional": True,
+        "validate": lambda v: None,
+    },
+    {
+        "key":      "vpc_subnetwork",
+        "label":    "Subnetwork for Direct VPC egress",
+        "hint":     "Only used with a vpc network; blank = network's subnet in the job region",
+        "optional": True,
+        "validate": lambda v: None,
+    },
+    {
+        "key":      "vpc_egress",
+        "label":    "VPC egress mode (when VPC networking is set)",
+        "hint":     "private-ranges-only (default) or all-traffic (subnet needs Private Google Access)",
+        "default":  "private-ranges-only",
+        "validate": lambda v: (
+            "Must be 'private-ranges-only' or 'all-traffic'"
+            if v.lower() not in ("private-ranges-only", "all-traffic") else None
+        ),
+    },
 ]
 
 
@@ -265,6 +299,20 @@ def _write_tfvars(path: str, config: dict) -> None:
     # Terraform expects an unquoted bool literal.
     use_latest = str(cfg.get("use_latest_existing_backup", "false")).lower() == "true"
 
+    # Optional networking → emit only what's set; map egress to the TF enum.
+    vpc_lines = []
+    if cfg.get("vpc_connector"):
+        vpc_lines.append(f'vpc_connector = "{cfg["vpc_connector"]}"')
+    if cfg.get("vpc_network"):
+        vpc_lines.append(f'vpc_network = "{cfg["vpc_network"]}"')
+    if cfg.get("vpc_subnetwork"):
+        vpc_lines.append(f'vpc_subnetwork = "{cfg["vpc_subnetwork"]}"')
+    if vpc_lines:
+        egress = str(cfg.get("vpc_egress", "private-ranges-only")).upper().replace("-", "_")
+        vpc_lines.append(f'vpc_egress = "{egress}"')
+    vpc_block = ("\n" + "\n".join(vpc_lines) + "\n") if vpc_lines else \
+        "\n# Public egress (no VPC). Set vpc_connector or vpc_network for private networking.\n"
+
     with open(path, "w") as f:
         f.write(f"""\
 # CloudSQL Sync — Terraform variables
@@ -282,7 +330,7 @@ schedule   = "{cfg['schedule']}"
 timezone   = "{cfg['timezone']}"
 
 use_latest_existing_backup = {"true" if use_latest else "false"}
-
+{vpc_block}
 # Build image first: gcloud builds submit sync_job/ --tag={image}
 container_image = "{image}"
 
@@ -432,6 +480,16 @@ def _prompt(field: dict, current: Optional[str], non_interactive: bool) -> str:
 # Safety check
 # ---------------------------------------------------------------------------
 
+def _check_vpc_exclusive(config: dict) -> None:
+    if config.get("vpc_connector") and config.get("vpc_network"):
+        print(
+            "\n  ERROR: vpc_connector and vpc_network are mutually exclusive — "
+            "set one (connector egress) or the other (Direct VPC egress), not both.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+
 def _check_prod_ne_nonprod(config: dict) -> None:
     if (config.get("prod_project_id") == config.get("nonprod_project_id") and
             config.get("prod_instance_name") == config.get("nonprod_instance_name")):
@@ -490,6 +548,7 @@ def main() -> None:
             config[field["key"]] = _prompt(field, current, non_interactive)
 
     _check_prod_ne_nonprod(config)
+    _check_vpc_exclusive(config)
 
     if not non_interactive:
         print()

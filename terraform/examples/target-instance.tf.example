@@ -35,9 +35,14 @@ resource "google_sql_database_instance" "nonprod_target" {
     }
 
     ip_configuration {
-      # POC uses a public IP. For production prefer Private IP + VPC; see
-      # ARCHITECTURE.md "Production gaps — Networking".
+      # POC uses a public IP. For production, use Private IP instead:
+      # disable ipv4 and attach the instance to your VPC (requires a
+      # private services access connection on that network). Then configure
+      # the sync job's egress with vpc_connector / vpc_network so it can
+      # reach the instance — see README "Networking".
       ipv4_enabled = true
+      # ipv4_enabled    = false
+      # private_network = "projects/YOUR_PROJECT/global/networks/YOUR_VPC"
     }
   }
 

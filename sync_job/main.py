@@ -623,6 +623,15 @@ def main() -> None:
         "reuse-latest-existing" if cfg.use_latest_existing_backup else "create-new",
     )
 
+    # SYNC_NETWORK_MODE is stamped by the deploy paths ("private" when a VPC
+    # connector / Direct VPC egress is configured). Anything else = public.
+    if os.getenv("SYNC_NETWORK_MODE", "public").strip().lower() != "private":
+        log.warning(
+            "Job egress is PUBLIC — Cloud SQL Admin API traffic traverses the "
+            "public internet. For production, configure private networking "
+            "(vpc_connector or vpc_network in config) — see README 'Networking'."
+        )
+
     service = build_sqladmin()
 
     # Fetch the password once and reuse for every target (it's the same secret).
