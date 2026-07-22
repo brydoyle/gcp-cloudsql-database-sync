@@ -1141,9 +1141,10 @@ class TestApplyPermissions:
             apply_permissions(svc, FAST_TARGET, FAST_CFG, password="pw")
         run.assert_not_called()
 
-    def test_requires_password(self):
+    def test_postgres_mode_requires_password(self):
         cfg = self._cfg(permission_mappings=({"from": "a@p.iam.gserviceaccount.com",
-                                              "to": "b@q.iam.gserviceaccount.com"},))
+                                              "to": "b@q.iam.gserviceaccount.com"},),
+                        permission_admin_mode="postgres")
         with pytest.raises(SyncError) as exc_info:
             apply_permissions(self._service(), FAST_TARGET, cfg, password=None)
         assert "NONPROD_DB_PASSWORD_SECRET" in str(exc_info.value)
@@ -1262,3 +1263,115 @@ class TestPermissionConfigParsing:
         with patch.dict("os.environ", env, clear=True):
             cfg = load_config()
         assert cfg.revoke_source_login is False
+
+
+# ---------------------------------------------------------------------------
+# Ephemeral admin mode
+# ---------------------------------------------------------------------------
+
+class TestEphemeralAdmin:
+
+    MAPPING = ({"from": "a@prod.iam.gserviceaccount.com",
+                "to": "b@dev.iam.gserviceaccount.com"},)
+
+    def _cfg(self, **kw):
+        return Config(**{**FAST_CFG.__dict__, "permission_mappings": self.MAPPING, **kw})
+
+    def _service(self):
+        svc = MagicMock()
+        svc.users.return_value.insert.return_value.execute.return_value = {"name": "op"}
+        svc.users.return_value.update.return_value.execute.return_value = {"name": "op"}
+        svc.users.return_value.delete.return_value.execute.return_value = {"name": "op"}
+        svc.operations.return_value.get.return_value.execute.return_value = {"status": "DONE"}
+        svc.instances.return_value.get.return_value.execute.return_value = {
+            "connectionName": "p:r:i"}
+        return svc
+
+    def _tmp_user_calls(self, svc, verb):
+        meth = getattr(svc.users.return_value, verb)
+        out = []
+        for c in meth.call_args_list:
+            name = c.kwargs.get("name") or (c.kwargs.get("body") or {}).get("name")
+            out.append(name)
+        return out
+
+    def test_auto_uses_postgres_when_password_available(self):
+        svc = self._service()
+        with patch("main._run_sql") as run:
+            apply_permissions(svc, FAST_TARGET, self._cfg(), password="pw")
+        assert run.call_args.kwargs["user"] == "postgres"
+        assert "cloudsql-sync-tmp-admin" not in self._tmp_user_calls(svc, "insert")
+
+    def test_auto_falls_back_to_ephemeral_without_password(self):
+        svc = self._service()
+        with patch("main._run_sql") as run:
+            apply_permissions(svc, FAST_TARGET, self._cfg(), password=None)
+        assert run.call_args.kwargs["user"] == "cloudsql-sync-tmp-admin"
+        assert "cloudsql-sync-tmp-admin" in self._tmp_user_calls(svc, "insert")
+
+    def test_ephemeral_mode_ignores_available_password(self):
+        svc = self._service()
+        cfg = self._cfg(permission_admin_mode="ephemeral")
+        with patch("main._run_sql") as run:
+            apply_permissions(svc, FAST_TARGET, cfg, password="pw")
+        assert run.call_args.kwargs["user"] == "cloudsql-sync-tmp-admin"
+
+    def test_ephemeral_user_is_deleted_after_success(self):
+        svc = self._service()
+        with patch("main._run_sql"):
+            apply_permissions(svc, FAST_TARGET, self._cfg(), password=None)
+        assert "cloudsql-sync-tmp-admin" in self._tmp_user_calls(svc, "delete")
+
+    def test_ephemeral_user_is_deleted_even_when_sql_fails(self):
+        svc = self._service()
+        with patch("main._run_sql", side_effect=RuntimeError("boom")):
+            with pytest.raises(SyncError):
+                apply_permissions(svc, FAST_TARGET, self._cfg(), password=None)
+        assert "cloudsql-sync-tmp-admin" in self._tmp_user_calls(svc, "delete")
+
+    def test_leftover_ephemeral_user_is_reclaimed(self):
+        """A 409 means a previous run crashed — reset the password, don't fail."""
+        svc = self._service()
+        # 409 only for the ephemeral admin — target identity creation succeeds.
+        # Keyed by name so the assertion doesn't depend on call ordering.
+        def insert_side_effect(**kwargs):
+            if kwargs.get("body", {}).get("name") == "cloudsql-sync-tmp-admin":
+                raise make_http_error(409)
+            return MagicMock(execute=MagicMock(return_value={"name": "op"}))
+        svc.users.return_value.insert.side_effect = insert_side_effect
+        with patch("main._run_sql") as run:
+            apply_permissions(svc, FAST_TARGET, self._cfg(), password=None)
+        assert "cloudsql-sync-tmp-admin" in self._tmp_user_calls(svc, "update")
+        run.assert_called_once()
+
+    def test_cleanup_failure_is_non_fatal(self):
+        svc = self._service()
+        svc.users.return_value.delete.return_value.execute.side_effect = RuntimeError("nope")
+        with patch("main._run_sql"):
+            apply_permissions(svc, FAST_TARGET, self._cfg(), password=None)
+
+    def test_random_password_not_reused_across_calls(self):
+        svc = self._service()
+        seen = []
+        with patch("main._run_sql", side_effect=lambda c, p, s, user=None: seen.append(p)):
+            apply_permissions(svc, FAST_TARGET, self._cfg(), password=None)
+            apply_permissions(svc, FAST_TARGET, self._cfg(), password=None)
+        assert len(seen) == 2 and seen[0] != seen[1]
+
+
+class TestAdminModeConfig:
+
+    def test_defaults_to_auto(self):
+        with patch.dict("os.environ", VALID_ENV, clear=True):
+            assert load_config().permission_admin_mode == "auto"
+
+    @pytest.mark.parametrize("mode", ["auto", "ephemeral", "postgres", "EPHEMERAL"])
+    def test_valid_modes(self, mode):
+        with patch.dict("os.environ", {**VALID_ENV, "PERMISSION_ADMIN_MODE": mode}, clear=True):
+            assert load_config().permission_admin_mode == mode.lower()
+
+    def test_invalid_mode_rejected(self):
+        with patch.dict("os.environ", {**VALID_ENV, "PERMISSION_ADMIN_MODE": "root"}, clear=True):
+            with pytest.raises(SystemExit) as exc_info:
+                load_config()
+        assert exc_info.value.code == 1

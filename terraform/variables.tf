@@ -187,6 +187,17 @@ variable "permission_grants" {
   default = []
 }
 
+variable "permission_admin_mode" {
+  description = "Which admin credential runs the GRANT statements. 'auto' (default) uses the Secret Manager postgres password when one is configured and otherwise creates a throwaway admin user; 'ephemeral' always uses a throwaway user (this tool never owns the postgres password); 'postgres' requires the Secret Manager password."
+  type        = string
+  default     = "auto"
+
+  validation {
+    condition     = contains(["auto", "ephemeral", "postgres"], var.permission_admin_mode)
+    error_message = "permission_admin_mode must be auto, ephemeral, or postgres."
+  }
+}
+
 variable "revoke_source_login" {
   description = "After mapping, ALTER ROLE <source> NOLOGIN so prod identities cannot authenticate against the target. The role is deliberately NOT dropped — the target inherits its privileges through it."
   type        = bool

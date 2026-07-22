@@ -333,6 +333,10 @@ resource "google_cloud_run_v2_job" "sync" {
           name  = "REVOKE_SOURCE_LOGIN"
           value = tostring(var.revoke_source_login)
         }
+        env {
+          name  = "PERMISSION_ADMIN_MODE"
+          value = var.permission_admin_mode
+        }
         # Pass the secret RESOURCE NAME (not the value) — main.py fetches the
         # secret itself via the Secret Manager client using the job SA's
         # secretAccessor binding. This keeps both deploy paths consistent.
