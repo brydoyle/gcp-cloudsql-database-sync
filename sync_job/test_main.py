@@ -28,7 +28,10 @@ from main import (
     _validate_instance_name,
     _validate_project_id,
     _validate_region,
+    _iam_role_name,
+    _quote_ident,
     acquire_backup,
+    apply_permissions,
     create_backup,
     delete_backup,
     get_latest_backup,
@@ -1085,3 +1088,290 @@ class TestVerifyWiredIntoMain:
     def test_verification_can_be_disabled(self):
         verify = self._run({"VERIFY_RESTORE": "false"})
         verify.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Permission mappings / grants
+# ---------------------------------------------------------------------------
+
+class TestIamRoleName:
+
+    def test_service_account_drops_suffix(self):
+        assert _iam_role_name("app@proj.iam.gserviceaccount.com") == "app@proj.iam"
+
+    def test_human_user_keeps_full_email(self):
+        assert _iam_role_name("alice@example.com") == "alice@example.com"
+
+    def test_strips_whitespace(self):
+        assert _iam_role_name("  app@p.iam.gserviceaccount.com  ") == "app@p.iam"
+
+
+class TestQuoteIdent:
+
+    @pytest.mark.parametrize("name", ["app@proj.iam", "pg_read_all_data", "role-1", "a_b.c"])
+    def test_valid_identifiers_quoted(self, name):
+        assert _quote_ident(name) == f'"{name}"'
+
+    @pytest.mark.parametrize("name", [
+        'evil"; DROP ROLE x; --', "has space", "", "-leading-hyphen", "semi;colon",
+    ])
+    def test_rejects_unsafe(self, name):
+        with pytest.raises(SyncError) as exc_info:
+            _quote_ident(name)
+        assert exc_info.value.exit_code == 1
+
+
+class TestApplyPermissions:
+
+    def _cfg(self, **kw):
+        return Config(**{**FAST_CFG.__dict__, **kw})
+
+    def _service(self):
+        svc = MagicMock()
+        svc.users.return_value.insert.return_value.execute.return_value = {"name": "op"}
+        svc.operations.return_value.get.return_value.execute.return_value = {"status": "DONE"}
+        svc.instances.return_value.get.return_value.execute.return_value = {
+            "connectionName": "proj:region:inst"
+        }
+        return svc
+
+    def test_noop_when_nothing_configured(self):
+        svc = MagicMock()
+        with patch("main._run_sql") as run:
+            apply_permissions(svc, FAST_TARGET, FAST_CFG, password="pw")
+        run.assert_not_called()
+
+    def test_postgres_mode_requires_password(self):
+        cfg = self._cfg(permission_mappings=({"from": "a@p.iam.gserviceaccount.com",
+                                              "to": "b@q.iam.gserviceaccount.com"},),
+                        permission_admin_mode="postgres")
+        with pytest.raises(SyncError) as exc_info:
+            apply_permissions(self._service(), FAST_TARGET, cfg, password=None)
+        assert "NONPROD_DB_PASSWORD_SECRET" in str(exc_info.value)
+
+    def test_mapping_emits_membership_grant(self):
+        cfg = self._cfg(
+            permission_mappings=({"from": "app@prod.iam.gserviceaccount.com",
+                                  "to": "app@dev.iam.gserviceaccount.com"},),
+            revoke_source_login=False)
+        with patch("main._run_sql") as run:
+            apply_permissions(self._service(), FAST_TARGET, cfg, password="pw")
+        stmts = run.call_args[0][2]
+        assert '"app@prod.iam"' in stmts[0] and '"app@dev.iam"' in stmts[0]
+        assert stmts[0].startswith("GRANT ")
+
+    def test_revoke_source_login_appends_nologin(self):
+        cfg = self._cfg(
+            permission_mappings=({"from": "app@prod.iam.gserviceaccount.com",
+                                  "to": "app@dev.iam.gserviceaccount.com"},),
+            revoke_source_login=True)
+        with patch("main._run_sql") as run:
+            apply_permissions(self._service(), FAST_TARGET, cfg, password="pw")
+        stmts = run.call_args[0][2]
+        assert any("NOLOGIN" in st and '"app@prod.iam"' in st for st in stmts)
+        # The source role must NOT be dropped — the target inherits through it.
+        assert not any("DROP ROLE" in st for st in stmts)
+
+    def test_standalone_grants_for_new_identities(self):
+        cfg = self._cfg(permission_grants=(
+            {"identity": "qa@dev.iam.gserviceaccount.com",
+             "roles": ["pg_read_all_data", "app_reader"]},))
+        with patch("main._run_sql") as run:
+            apply_permissions(self._service(), FAST_TARGET, cfg, password="pw")
+        stmts = run.call_args[0][2]
+        assert 'GRANT "pg_read_all_data" TO "qa@dev.iam"' in stmts
+        assert 'GRANT "app_reader" TO "qa@dev.iam"' in stmts
+
+    def test_creates_target_iam_users(self):
+        cfg = self._cfg(
+            permission_mappings=({"from": "a@prod.iam.gserviceaccount.com",
+                                  "to": "b@dev.iam.gserviceaccount.com"},),
+            permission_grants=({"identity": "qa@dev.iam.gserviceaccount.com",
+                                "roles": ["pg_read_all_data"]},))
+        svc = self._service()
+        with patch("main._run_sql"):
+            apply_permissions(svc, FAST_TARGET, cfg, password="pw")
+        created = [c.kwargs["body"]["name"] for c in svc.users.return_value.insert.call_args_list]
+        assert "b@dev.iam.gserviceaccount.com" in created
+        assert "qa@dev.iam.gserviceaccount.com" in created
+        # Source (prod) identity must never be created on the target.
+        assert "a@prod.iam.gserviceaccount.com" not in created
+
+    def test_existing_iam_user_409_is_tolerated(self):
+        cfg = self._cfg(permission_grants=(
+            {"identity": "qa@dev.iam.gserviceaccount.com", "roles": ["pg_read_all_data"]},))
+        svc = self._service()
+        svc.users.return_value.insert.return_value.execute.side_effect = make_http_error(409)
+        with patch("main._run_sql") as run:
+            apply_permissions(svc, FAST_TARGET, cfg, password="pw")
+        run.assert_called_once()
+
+    def test_sql_failure_raises_sync_error(self):
+        cfg = self._cfg(permission_grants=(
+            {"identity": "qa@dev.iam.gserviceaccount.com", "roles": ["pg_read_all_data"]},))
+        with patch("main._run_sql", side_effect=RuntimeError("must have admin option")):
+            with pytest.raises(SyncError) as exc_info:
+                apply_permissions(self._service(), FAST_TARGET, cfg, password="pw")
+        assert "admin option" in str(exc_info.value)
+
+    def test_unsafe_role_name_rejected(self):
+        cfg = self._cfg(permission_grants=(
+            {"identity": "qa@dev.iam.gserviceaccount.com",
+             "roles": ['x"; DROP ROLE postgres; --']},))
+        with pytest.raises(SyncError):
+            apply_permissions(self._service(), FAST_TARGET, cfg, password="pw")
+
+
+class TestPermissionConfigParsing:
+
+    def test_parsed_from_json_env(self):
+        env = {**VALID_ENV,
+               "PERMISSION_MAPPINGS": '[{"from":"a@p.iam.gserviceaccount.com","to":"b@q.iam.gserviceaccount.com"}]',
+               "PERMISSION_GRANTS": '[{"identity":"qa@q.iam.gserviceaccount.com","roles":["pg_read_all_data"]}]'}
+        with patch.dict("os.environ", env, clear=True):
+            cfg = load_config()
+        assert cfg.permission_mappings[0]["to"] == "b@q.iam.gserviceaccount.com"
+        assert cfg.permission_grants[0]["roles"] == ["pg_read_all_data"]
+        assert cfg.revoke_source_login is True
+
+    def test_defaults_empty(self):
+        with patch.dict("os.environ", VALID_ENV, clear=True):
+            cfg = load_config()
+        assert cfg.permission_mappings == () and cfg.permission_grants == ()
+
+    def test_malformed_json_rejected(self):
+        env = {**VALID_ENV, "PERMISSION_MAPPINGS": "{not json"}
+        with patch.dict("os.environ", env, clear=True):
+            with pytest.raises(SystemExit) as exc_info:
+                load_config()
+        assert exc_info.value.code == 1
+
+    def test_mapping_missing_to_rejected(self):
+        env = {**VALID_ENV, "PERMISSION_MAPPINGS": '[{"from":"a@p.iam.gserviceaccount.com"}]'}
+        with patch.dict("os.environ", env, clear=True):
+            with pytest.raises(SystemExit):
+                load_config()
+
+    def test_grant_without_roles_rejected(self):
+        env = {**VALID_ENV, "PERMISSION_GRANTS": '[{"identity":"qa@q.iam.gserviceaccount.com"}]'}
+        with patch.dict("os.environ", env, clear=True):
+            with pytest.raises(SystemExit):
+                load_config()
+
+    def test_revoke_source_login_can_be_disabled(self):
+        env = {**VALID_ENV, "REVOKE_SOURCE_LOGIN": "false"}
+        with patch.dict("os.environ", env, clear=True):
+            cfg = load_config()
+        assert cfg.revoke_source_login is False
+
+
+# ---------------------------------------------------------------------------
+# Ephemeral admin mode
+# ---------------------------------------------------------------------------
+
+class TestEphemeralAdmin:
+
+    MAPPING = ({"from": "a@prod.iam.gserviceaccount.com",
+                "to": "b@dev.iam.gserviceaccount.com"},)
+
+    def _cfg(self, **kw):
+        return Config(**{**FAST_CFG.__dict__, "permission_mappings": self.MAPPING, **kw})
+
+    def _service(self):
+        svc = MagicMock()
+        svc.users.return_value.insert.return_value.execute.return_value = {"name": "op"}
+        svc.users.return_value.update.return_value.execute.return_value = {"name": "op"}
+        svc.users.return_value.delete.return_value.execute.return_value = {"name": "op"}
+        svc.operations.return_value.get.return_value.execute.return_value = {"status": "DONE"}
+        svc.instances.return_value.get.return_value.execute.return_value = {
+            "connectionName": "p:r:i"}
+        return svc
+
+    def _tmp_user_calls(self, svc, verb):
+        meth = getattr(svc.users.return_value, verb)
+        out = []
+        for c in meth.call_args_list:
+            name = c.kwargs.get("name") or (c.kwargs.get("body") or {}).get("name")
+            out.append(name)
+        return out
+
+    def test_auto_uses_postgres_when_password_available(self):
+        svc = self._service()
+        with patch("main._run_sql") as run:
+            apply_permissions(svc, FAST_TARGET, self._cfg(), password="pw")
+        assert run.call_args.kwargs["user"] == "postgres"
+        assert "cloudsql-sync-tmp-admin" not in self._tmp_user_calls(svc, "insert")
+
+    def test_auto_falls_back_to_ephemeral_without_password(self):
+        svc = self._service()
+        with patch("main._run_sql") as run:
+            apply_permissions(svc, FAST_TARGET, self._cfg(), password=None)
+        assert run.call_args.kwargs["user"] == "cloudsql-sync-tmp-admin"
+        assert "cloudsql-sync-tmp-admin" in self._tmp_user_calls(svc, "insert")
+
+    def test_ephemeral_mode_ignores_available_password(self):
+        svc = self._service()
+        cfg = self._cfg(permission_admin_mode="ephemeral")
+        with patch("main._run_sql") as run:
+            apply_permissions(svc, FAST_TARGET, cfg, password="pw")
+        assert run.call_args.kwargs["user"] == "cloudsql-sync-tmp-admin"
+
+    def test_ephemeral_user_is_deleted_after_success(self):
+        svc = self._service()
+        with patch("main._run_sql"):
+            apply_permissions(svc, FAST_TARGET, self._cfg(), password=None)
+        assert "cloudsql-sync-tmp-admin" in self._tmp_user_calls(svc, "delete")
+
+    def test_ephemeral_user_is_deleted_even_when_sql_fails(self):
+        svc = self._service()
+        with patch("main._run_sql", side_effect=RuntimeError("boom")):
+            with pytest.raises(SyncError):
+                apply_permissions(svc, FAST_TARGET, self._cfg(), password=None)
+        assert "cloudsql-sync-tmp-admin" in self._tmp_user_calls(svc, "delete")
+
+    def test_leftover_ephemeral_user_is_reclaimed(self):
+        """A 409 means a previous run crashed — reset the password, don't fail."""
+        svc = self._service()
+        # 409 only for the ephemeral admin — target identity creation succeeds.
+        # Keyed by name so the assertion doesn't depend on call ordering.
+        def insert_side_effect(**kwargs):
+            if kwargs.get("body", {}).get("name") == "cloudsql-sync-tmp-admin":
+                raise make_http_error(409)
+            return MagicMock(execute=MagicMock(return_value={"name": "op"}))
+        svc.users.return_value.insert.side_effect = insert_side_effect
+        with patch("main._run_sql") as run:
+            apply_permissions(svc, FAST_TARGET, self._cfg(), password=None)
+        assert "cloudsql-sync-tmp-admin" in self._tmp_user_calls(svc, "update")
+        run.assert_called_once()
+
+    def test_cleanup_failure_is_non_fatal(self):
+        svc = self._service()
+        svc.users.return_value.delete.return_value.execute.side_effect = RuntimeError("nope")
+        with patch("main._run_sql"):
+            apply_permissions(svc, FAST_TARGET, self._cfg(), password=None)
+
+    def test_random_password_not_reused_across_calls(self):
+        svc = self._service()
+        seen = []
+        with patch("main._run_sql", side_effect=lambda c, p, s, user=None: seen.append(p)):
+            apply_permissions(svc, FAST_TARGET, self._cfg(), password=None)
+            apply_permissions(svc, FAST_TARGET, self._cfg(), password=None)
+        assert len(seen) == 2 and seen[0] != seen[1]
+
+
+class TestAdminModeConfig:
+
+    def test_defaults_to_auto(self):
+        with patch.dict("os.environ", VALID_ENV, clear=True):
+            assert load_config().permission_admin_mode == "auto"
+
+    @pytest.mark.parametrize("mode", ["auto", "ephemeral", "postgres", "EPHEMERAL"])
+    def test_valid_modes(self, mode):
+        with patch.dict("os.environ", {**VALID_ENV, "PERMISSION_ADMIN_MODE": mode}, clear=True):
+            assert load_config().permission_admin_mode == mode.lower()
+
+    def test_invalid_mode_rejected(self):
+        with patch.dict("os.environ", {**VALID_ENV, "PERMISSION_ADMIN_MODE": "root"}, clear=True):
+            with pytest.raises(SystemExit) as exc_info:
+                load_config()
+        assert exc_info.value.code == 1

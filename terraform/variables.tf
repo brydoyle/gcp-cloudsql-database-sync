@@ -161,3 +161,45 @@ variable "vpc_egress" {
     error_message = "vpc_egress must be PRIVATE_RANGES_ONLY or ALL_TRAFFIC."
   }
 }
+
+# ── Cross-project permission mapping (optional) ───────────────────────────────
+#
+# A snapshot restore carries prod's PostgreSQL roles and grants into the target
+# verbatim — but GCP IAM does not travel with it. So prod IAM identities land as
+# dead roles in the target, and the target's own identities have no role at all.
+# These settings bridge that gap after each restore.
+
+variable "permission_mappings" {
+  description = "Map source (prod) IAM identities to target identities. Each becomes GRANT \"<from-role>\" TO \"<to-role>\", so the target inherits every privilege the prod identity held — across all databases — via role membership."
+  type = list(object({
+    from = string
+    to   = string
+  }))
+  default = []
+}
+
+variable "permission_grants" {
+  description = "Grant named PostgreSQL roles to identities that have no prod counterpart (e.g. a QA reader getting pg_read_all_data). Roles must already exist in the restored database or be PostgreSQL predefined roles."
+  type = list(object({
+    identity = string
+    roles    = list(string)
+  }))
+  default = []
+}
+
+variable "permission_admin_mode" {
+  description = "Which admin credential runs the GRANT statements. 'auto' (default) uses the Secret Manager postgres password when one is configured and otherwise creates a throwaway admin user; 'ephemeral' always uses a throwaway user (this tool never owns the postgres password); 'postgres' requires the Secret Manager password."
+  type        = string
+  default     = "auto"
+
+  validation {
+    condition     = contains(["auto", "ephemeral", "postgres"], var.permission_admin_mode)
+    error_message = "permission_admin_mode must be auto, ephemeral, or postgres."
+  }
+}
+
+variable "revoke_source_login" {
+  description = "After mapping, ALTER ROLE <source> NOLOGIN so prod identities cannot authenticate against the target. The role is deliberately NOT dropped — the target inherits its privileges through it."
+  type        = bool
+  default     = true
+}

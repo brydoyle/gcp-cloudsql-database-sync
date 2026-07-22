@@ -27,9 +27,11 @@ Exit codes:
 """
 
 import dataclasses
+import json
 import logging
 import os
 import re
+import secrets
 import sys
 import time
 
@@ -124,6 +126,72 @@ class Config:
     poll_interval: int
     operation_timeout: int
     use_latest_existing_backup: bool = False
+    permission_mappings: tuple = ()   # ({"from": principal, "to": principal}, ...)
+    permission_grants: tuple = ()     # ({"identity": principal, "roles": [...]}, ...)
+    revoke_source_login: bool = True
+    permission_admin_mode: str = "auto"  # auto | ephemeral | postgres
+
+
+# Cloud SQL IAM principals → PostgreSQL role names. Service-account roles drop
+# the ".gserviceaccount.com" suffix; human users keep the full email.
+_IAM_SA_SUFFIX = ".gserviceaccount.com"
+
+# Conservative identifier charset for anything we interpolate into SQL.
+_SQL_IDENT_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_@.\-]*$")
+
+
+def _iam_role_name(principal: str) -> str:
+    """PostgreSQL role name for a Cloud SQL IAM principal."""
+    p = principal.strip()
+    return p[: -len(_IAM_SA_SUFFIX)] if p.endswith(_IAM_SA_SUFFIX) else p
+
+
+def _quote_ident(name: str) -> str:
+    """Validate then double-quote a SQL identifier. Values come from operator
+    config, but we still refuse anything outside a safe charset."""
+    if not _SQL_IDENT_RE.match(name or ""):
+        raise SyncError(f"Unsafe SQL identifier in permission config: {name!r}", exit_code=1)
+    return '"' + name.replace('"', '""') + '"'
+
+
+def _json_list_env(name: str, errors: list) -> tuple:
+    """Parse a JSON-array env var into a tuple of dicts (empty when unset)."""
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return ()
+    try:
+        value = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        errors.append(f"{name} must be valid JSON: {exc}")
+        return ()
+    if not isinstance(value, list) or not all(isinstance(i, dict) for i in value):
+        errors.append(f"{name} must be a JSON array of objects")
+        return ()
+    return tuple(value)
+
+
+# Recognisable name so a leftover from a crashed run is obvious and greppable.
+_EPHEMERAL_ADMIN_USER = "cloudsql-sync-tmp-admin"
+_ADMIN_MODES = ("auto", "ephemeral", "postgres")
+
+
+def _validate_admin_mode(mode: str, errors: list) -> None:
+    if mode not in _ADMIN_MODES:
+        errors.append(
+            f"PERMISSION_ADMIN_MODE must be one of {', '.join(_ADMIN_MODES)}, got {mode!r}"
+        )
+
+
+def _validate_permissions(mappings: tuple, grants: tuple, errors: list) -> None:
+    for i, m in enumerate(mappings, 1):
+        if not m.get("from") or not m.get("to"):
+            errors.append(f"PERMISSION_MAPPINGS[{i}] needs both 'from' and 'to'")
+    for i, g in enumerate(grants, 1):
+        if not g.get("identity"):
+            errors.append(f"PERMISSION_GRANTS[{i}] needs 'identity'")
+        roles = g.get("roles")
+        if not isinstance(roles, list) or not roles:
+            errors.append(f"PERMISSION_GRANTS[{i}] needs a non-empty 'roles' list")
 
 
 def _require_env(name: str, errors: list) -> str:
@@ -270,6 +338,12 @@ def load_config() -> Config:
         "OPERATION_TIMEOUT_SECONDS", default_value=7200, minimum=60, maximum=86400, errors=errors
     )
 
+    perm_mappings = _json_list_env("PERMISSION_MAPPINGS", errors)
+    perm_grants   = _json_list_env("PERMISSION_GRANTS", errors)
+    _validate_permissions(perm_mappings, perm_grants, errors)
+    admin_mode = (os.getenv("PERMISSION_ADMIN_MODE", "auto").strip().lower() or "auto")
+    _validate_admin_mode(admin_mode, errors)
+
     _validate_project_id(prod_project, "PROD_PROJECT_ID", errors)
     _validate_instance_name(prod_instance, "PROD_INSTANCE_NAME", errors)
     _validate_region(region, "GCP_REGION", errors)
@@ -295,6 +369,10 @@ def load_config() -> Config:
         poll_interval=poll,
         operation_timeout=timeout,
         use_latest_existing_backup=_bool_env("USE_LATEST_EXISTING_BACKUP", default=False),
+        permission_mappings=perm_mappings,
+        permission_grants=perm_grants,
+        revoke_source_login=_bool_env("REVOKE_SOURCE_LOGIN", default=True),
+        permission_admin_mode=admin_mode,
     )
 
 
@@ -580,6 +658,201 @@ def verify_target(service, target: Target, cfg: Config, password=None) -> None:
     log.info("Verification passed: %s is RUNNABLE and serving SQL.", target)
 
 
+def _run_sql(connection_name: str, password: str, statements: list,
+             user: str = "postgres") -> None:
+    """Execute statements as `user` over the Cloud SQL Python Connector.
+
+    Role membership is cluster-wide in PostgreSQL, so a single connection to
+    the `postgres` database is enough — no per-database looping needed.
+    """
+    from google.cloud.sql.connector import Connector
+
+    with Connector() as connector:
+        conn = connector.connect(
+            connection_name, "pg8000",
+            user=user, password=password, db="postgres",
+        )
+        try:
+            cur = conn.cursor()
+            for stmt in statements:
+                log.info("  SQL: %s", stmt)
+                cur.execute(stmt)
+            conn.commit()
+        finally:
+            conn.close()
+
+
+def _ensure_iam_db_user(service, target: Target, principal: str, cfg: Config) -> None:
+    """Create the IAM database user on the target if it does not exist.
+
+    IAM DB users must be created through the Cloud SQL Admin API (not raw SQL)
+    so Cloud SQL wires up IAM authentication for the resulting role.
+    """
+    user_type = ("CLOUD_IAM_SERVICE_ACCOUNT"
+                 if principal.strip().endswith(_IAM_SA_SUFFIX)
+                 else "CLOUD_IAM_USER")
+    try:
+        op = (
+            service.users()
+            .insert(project=target.project, instance=target.instance,
+                    body={"name": principal, "type": user_type})
+            .execute(num_retries=3)
+        )
+    except HttpError as exc:
+        if exc.status_code == 409:
+            log.info("  IAM DB user %s already present on %s", principal, target)
+            return
+        _raise_for_http_error(exc, f"creating IAM DB user {principal} on {target}")
+
+    op_name = _extract_op_name(op, "users.insert")
+    wait_for_operation(service, target.project, op_name, cfg)
+    log.info("  Created IAM DB user %s on %s", principal, target)
+
+
+def _create_ephemeral_admin(service, target: Target, cfg: Config) -> str:
+    """Create a short-lived admin user with an in-memory random password.
+
+    Lets permission mapping run without this tool ever owning the `postgres`
+    password. Cloud SQL grants API-created PostgreSQL users cloudsqlsuperuser,
+    which is what allows them to GRANT roles.
+    """
+    password = secrets.token_urlsafe(32)
+    body = {"name": _EPHEMERAL_ADMIN_USER, "password": password}
+    try:
+        op = (
+            service.users()
+            .insert(project=target.project, instance=target.instance, body=body)
+            .execute(num_retries=3)
+        )
+    except HttpError as exc:
+        if exc.status_code == 409:
+            # Left behind by a previous crashed run — take it over by setting a
+            # password we know, rather than failing the sync.
+            log.warning(
+                "Ephemeral admin user already exists on %s (leftover from an "
+                "interrupted run) — resetting its password to reclaim it.", target,
+            )
+            op = (
+                service.users()
+                .update(project=target.project, instance=target.instance,
+                        name=_EPHEMERAL_ADMIN_USER, body=body)
+                .execute(num_retries=3)
+            )
+        else:
+            _raise_for_http_error(exc, f"creating ephemeral admin user on {target}")
+
+    op_name = _extract_op_name(op, "users.insert (ephemeral admin)")
+    wait_for_operation(service, target.project, op_name, cfg)
+    log.info("  Created ephemeral admin user on %s.", target)
+    return password
+
+
+def _delete_ephemeral_admin(service, target: Target, cfg: Config) -> None:
+    """Best-effort teardown — a cleanup failure must never fail the sync."""
+    try:
+        op = (
+            service.users()
+            .delete(project=target.project, instance=target.instance,
+                    name=_EPHEMERAL_ADMIN_USER)
+            .execute(num_retries=3)
+        )
+        op_name = op.get("name")
+        if op_name:
+            wait_for_operation(service, target.project, op_name, cfg)
+        log.info("  Removed ephemeral admin user from %s.", target)
+    except Exception as exc:  # noqa: BLE001
+        log.warning(
+            "Could not remove ephemeral admin user '%s' from %s: %s — "
+            "delete it manually.", _EPHEMERAL_ADMIN_USER, target, exc,
+        )
+
+
+def apply_permissions(service, target: Target, cfg: Config, password=None) -> None:
+    """Apply cross-project permission mappings and standalone grants.
+
+    Two independent capabilities, both expressed as PostgreSQL role membership:
+
+    - permission_mappings: GRANT "<prod-identity>" TO "<target-identity>".
+      The restored prod role still holds every privilege it had in prod, so a
+      single membership grant transfers all of them — across every database —
+      without enumerating object grants.
+    - permission_grants: GRANT "<named-role>" TO "<identity>" for identities
+      that have no prod counterpart (e.g. a QA reader getting pg_read_all_data).
+
+    revoke_source_login then does ALTER ROLE ... NOLOGIN on each mapped source
+    role. We deliberately do NOT drop it: the target inherits its privileges
+    THROUGH that role, so dropping it would revoke exactly what we just granted.
+    """
+    if not cfg.permission_mappings and not cfg.permission_grants:
+        return
+
+    # Pick the admin credential used to run the GRANTs.
+    #   postgres  — reuse the Secret Manager password (requires it)
+    #   ephemeral — create a throwaway admin user, delete it afterwards
+    #   auto      — postgres when a password is available, else ephemeral
+    mode = cfg.permission_admin_mode
+    if mode == "postgres" and password is None:
+        raise SyncError(
+            "permission_admin_mode='postgres' needs NONPROD_DB_PASSWORD_SECRET set "
+            "(after a restore the target's postgres password is prod's, so the job "
+            "must set one it knows). Use permission_admin_mode='ephemeral' to run "
+            "the grants as a throwaway admin user instead."
+        )
+    use_ephemeral = mode == "ephemeral" or (mode == "auto" and password is None)
+
+    log.info(
+        "Applying permission mappings/grants on %s (admin: %s) ...",
+        target, _EPHEMERAL_ADMIN_USER if use_ephemeral else "postgres",
+    )
+
+    # 1. Make sure every target-side identity exists as an IAM DB user.
+    for mapping in cfg.permission_mappings:
+        _ensure_iam_db_user(service, target, mapping["to"], cfg)
+    for grant in cfg.permission_grants:
+        _ensure_iam_db_user(service, target, grant["identity"], cfg)
+
+    # 2. Build the statement list.
+    statements = []
+    for mapping in cfg.permission_mappings:
+        src = _quote_ident(_iam_role_name(mapping["from"]))
+        dst = _quote_ident(_iam_role_name(mapping["to"]))
+        statements.append(f"GRANT {src} TO {dst}")
+    for grant in cfg.permission_grants:
+        who = _quote_ident(_iam_role_name(grant["identity"]))
+        for role in grant["roles"]:
+            statements.append(f"GRANT {_quote_ident(role)} TO {who}")
+    if cfg.revoke_source_login:
+        for mapping in cfg.permission_mappings:
+            src = _quote_ident(_iam_role_name(mapping["from"]))
+            statements.append(f"ALTER ROLE {src} NOLOGIN")
+
+    # 3. Run them.
+    try:
+        inst = (
+            service.instances()
+            .get(project=target.project, instance=target.instance)
+            .execute(num_retries=3)
+        )
+    except HttpError as exc:
+        _raise_for_http_error(exc, f"reading {target} for permission mapping")
+    conn_name = inst.get("connectionName") or f"{target.project}:{cfg.region}:{target.instance}"
+
+    admin_user = "postgres"
+    admin_password = password
+    if use_ephemeral:
+        admin_user = _EPHEMERAL_ADMIN_USER
+        admin_password = _create_ephemeral_admin(service, target, cfg)
+
+    try:
+        _run_sql(conn_name, admin_password, statements, user=admin_user)
+    except Exception as exc:  # noqa: BLE001
+        raise SyncError(f"Permission mapping failed on {target}: {exc}") from exc
+    finally:
+        if use_ephemeral:
+            _delete_ephemeral_admin(service, target, cfg)
+    log.info("Permissions applied on %s (%d statement(s)).", target, len(statements))
+
+
 def delete_backup(service, backup_id: int, cfg: Config) -> None:
     """Delete the on-demand backup to avoid accumulating against quota.
 
@@ -728,6 +1001,7 @@ def main() -> None:
                 restore_to_target(service, backup_id, target, cfg)
                 if password is not None:
                     reset_target_password(service, target, cfg, password)
+                apply_permissions(service, target, cfg, password)
                 if verify_enabled:
                     verify_target(service, target, cfg, password)
             except SyncError as exc:

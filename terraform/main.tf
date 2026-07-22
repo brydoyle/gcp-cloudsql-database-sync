@@ -39,6 +39,20 @@ locals {
   # Private networking is opt-in: connector OR direct VPC egress. Blank = public.
   use_vpc = var.vpc_connector != "" || var.vpc_network != ""
 
+  # Target-side identities that must be able to authenticate to the restored
+  # instances. Sources (prod identities) are deliberately excluded — they are
+  # privilege containers in the target, not logins.
+  permission_identities = distinct(concat(
+    [for m in var.permission_mappings : m.to],
+    [for g in var.permission_grants : g.identity],
+  ))
+
+  # instanceUser bindings are needed on every project that hosts a target.
+  identity_project_pairs = {
+    for pair in setproduct(local.permission_identities, local.target_projects) :
+    "${pair[0]}|${pair[1]}" => { identity = pair[0], project = pair[1] }
+  }
+
   # Overdue ("absence") alert: Cloud Monitoring alerting can only look back
   # 24h (condition_absent caps at 23h30m; MQL at 24h — verified against the
   # live API). So the alert is only expressible for daily-or-finer cadences;
@@ -201,6 +215,19 @@ resource "google_project_iam_member" "job_target_cloudsql_admin" {
   member   = "serviceAccount:${google_service_account.job.email}"
 }
 
+# Let each mapped target identity authenticate to the restored instance.
+# Without this the PostgreSQL role exists but IAM login is refused.
+resource "google_project_iam_member" "permission_identity_instance_user" {
+  for_each = local.identity_project_pairs
+  project  = each.value.project
+  role     = "roles/cloudsql.instanceUser"
+  member = (
+    endswith(each.value.identity, ".gserviceaccount.com")
+    ? "serviceAccount:${each.value.identity}"
+    : "user:${each.value.identity}"
+  )
+}
+
 # ── Scheduler service account ─────────────────────────────────────────────────
 
 resource "google_service_account" "scheduler" {
@@ -293,6 +320,22 @@ resource "google_cloud_run_v2_job" "sync" {
         env {
           name  = "VERIFY_RESTORE"
           value = tostring(var.verify_restore)
+        }
+        env {
+          name  = "PERMISSION_MAPPINGS"
+          value = jsonencode(var.permission_mappings)
+        }
+        env {
+          name  = "PERMISSION_GRANTS"
+          value = jsonencode(var.permission_grants)
+        }
+        env {
+          name  = "REVOKE_SOURCE_LOGIN"
+          value = tostring(var.revoke_source_login)
+        }
+        env {
+          name  = "PERMISSION_ADMIN_MODE"
+          value = var.permission_admin_mode
         }
         # Pass the secret RESOURCE NAME (not the value) — main.py fetches the
         # secret itself via the Secret Manager client using the job SA's
